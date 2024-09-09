@@ -93,7 +93,7 @@ class IndependentLowerer:
       idx, valid = x.st_arg.to_indexed_uops(self.ridxs if x.op is UOps.LOAD and x.src[0].op is UOps.DEFINE_LOCAL else self.idxs)
       # TODO: check has_valid in UPat, not here
       has_valid = valid.op is not UOps.CONST or valid.arg is not True
-      if x.op is UOps.CONST: return valid.where(x.const_like(x.arg), x.const_like(0))
+      if x.op is UOps.VALID: return valid
       buf = x.src[0]
       if x.op is UOps.LOAD:
         barrier = (UOp(UOps.BARRIER, None, (self.to_uop(x.src[2]),)),) if x.src[0].op is UOps.DEFINE_LOCAL else ()

@@ -330,7 +330,7 @@ class UOps(HashEnum):
   ENDRANGE = auto()
   ENDIF = auto()
 
-BUFFER_UOPS = {UOps.LOAD, UOps.STORE, UOps.CONST}
+BUFFER_UOPS = {UOps.LOAD, UOps.STORE, UOps.VALID}
 
 END_FOR_UOP = {UOps.IF:(UOps.STORE, UOps.ENDIF), UOps.RANGE:(UOps.ASSIGN, UOps.ENDRANGE)}
 
@@ -343,7 +343,7 @@ class UOp(MathTrait):
   @functools.cached_property
   def st(self) -> Optional[ShapeTracker]:
     from tinygrad.shape.shapetracker import ShapeTracker
-    if self.op in {UOps.DEFINE_LOCAL, UOps.DEFINE_GLOBAL}: return None
+    if self.op in {UOps.DEFINE_GLOBAL, UOps.DEFINE_LOCAL, UOps.DEFINE_VAR, UOps.CONST}: return None
     if self.op in BUFFER_UOPS: return self.st_arg
     if self.op in {UOps.SHAPETRACKER, UOps.SWIZZLE}: return self.arg
     src_sts = [x.st for x in self.src if x.st is not None]
@@ -366,7 +366,7 @@ class UOp(MathTrait):
       self.arg in {BinaryOps.ADD, BinaryOps.MUL, BinaryOps.MAX, BinaryOps.CMPNE, BinaryOps.XOR, BinaryOps.AND, BinaryOps.OR})
   # *** uop syntactic sugar
   @property
-  def st_loc(self) -> int: return 0 if self.op is UOps.CONST else 1
+  def st_loc(self) -> int: return 0 if self.op is UOps.VALID else 1
   @property
   def st_arg(self) -> ShapeTracker:
     assert self.op in BUFFER_UOPS, f"st_arg called on {self.op}"
@@ -402,7 +402,7 @@ class UOp(MathTrait):
   def full_shape(self) -> Tuple[sint, ...]:
     if self.op is UOps.SHAPETRACKER: return self.arg.shape
     # NOTE: UOps.DEFINE_GLOBAL and UOps.DEFINE_LOCAL don't have shape
-    return tuple(max(x) for x in zip(*[x.full_shape for x in self.src if x.op not in {UOps.DEFINE_GLOBAL, UOps.DEFINE_LOCAL}]))
+    return tuple(max(x) for x in zip(*[x.full_shape for x in self.src if x.op not in {UOps.DEFINE_GLOBAL, UOps.DEFINE_LOCAL, UOps.DEFINE_VAR, UOps.CONST}]))
   def vars(self) -> Set[UOp]: return set([x for x in self.sparents if x.op is UOps.DEFINE_VAR])
   def variables(self) -> List[Variable]:
     st_vars: List[Set[Variable]] = [x.st_arg.vars() for x in self.sparents if x.op in BUFFER_UOPS]
