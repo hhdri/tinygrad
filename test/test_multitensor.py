@@ -578,7 +578,7 @@ class TestMultiTensor(unittest.TestCase):
         ast = si.ast.src[0]
         assert ast.op is UOps.STORE
         assert ast.src[2].arg is BinaryOps.MUL
-        assert ast.src[2].src[1].src[1].op is UOps.CONST and ast.src[2].src[1].src[1].arg == 2
+        assert ast.src[2].src[0].src[1].op is UOps.CONST and ast.src[2].src[0].src[1].arg == 2
         assert ast.src[2].src[1].op is UOps.LOAD
       t = t + t.full_like(3)
       for si in t.schedule():
