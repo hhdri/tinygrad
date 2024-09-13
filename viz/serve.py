@@ -20,25 +20,27 @@ def uop_to_json(x:UOp):
 
 class Handler(BaseHTTPRequestHandler):
   def do_GET(self):
-    if self.path == "/":
-      self.send_response(200)
-      self.end_headers()
-      with open("index.html", "rb") as f:
-        ret = f.read()
-    elif re.search(r'/\d+', self.path):
+    # *** get uops
+    if re.search(r'/\d+', self.path):
       self.send_response(200)
       self.send_header('Content-type', 'application/json')
       self.end_headers()
-      ret = uop_to_json(uops[int(self.path.split("/")[-1])][0])
-    else:
+      return self.wfile.write(uop_to_json(uops[int(self.path.split("/")[-1])][0]))
+    # *** serve static files
+    if self.path == "/": self.path = "/index.html"
+    fp = os.path.join(os.path.dirname(__file__), self.path.lstrip("/"))
+    if not os.path.exists(fp):
       self.send_response(404)
-      ret = b""
-    return self.wfile.write(ret)
+      self.end_headers()
+      return self.wfile.write(b"not found")
+    with open(fp, "rb") as f: ret = f.read()
+    self.send_header("Content-Type", "text/css" if fp.endswith(".css") else "text/html" if fp.endswith(".html") else "application/octet-stream")
+    self.end_headers()
+    self.wfile.write(ret)
 
 if __name__ == "__main__":
   threading.Thread(target=reloader).start()
   with open("/tmp/rewrites.pkl", "rb") as f:
     uops = pickle.load(f)
-  #print(uop_to_json(uops[0][0]))
   print("serving at port 8000")
   HTTPServer(('', 8000), Handler).serve_forever()
