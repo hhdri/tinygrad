@@ -1,0 +1,29 @@
+html {
+	background-color: #111111;
+}
+
+body {
+  height: 100vh;
+}
+
+text {
+  font-weight: 300;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 14px;
+}
+
+.node rect {
+	stroke: #999;
+	fill: #fff;
+	stroke-width: 1.5px;
+}
+
+.edgePath path {
+  stroke: #777;
+  stroke-width: 1.5px;
+}
+
+svg {
+  width: 100%;
+  height: 100%;
+}
