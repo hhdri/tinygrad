@@ -365,6 +365,7 @@ def _graph_schedule(outs:List[LazyBuffer]) -> \
       if GRAPH: realized_lazybuffer(out, 0) # NOTE: this kernel_number is wrong, we don't know this here.
       del out.srcs  # can only schedule once
   schedule_targets = {out:lsi for lsi in prescheduled for out in lsi.outputs}
+  assign_kernels = [lsi for lsi in prescheduled if lsi.ast.op is UOps.SINK and any(x.src[2].op is UOps.ASSIGN for x in lsi.ast.src)]
 
   graph: DefaultDict[ScheduleItem, List[ScheduleItem]] = defaultdict(list)
   in_degree: DefaultDict[ScheduleItem, int] = defaultdict(int)
@@ -373,6 +374,7 @@ def _graph_schedule(outs:List[LazyBuffer]) -> \
     # realize outputs after all parents are realized
     scheduled_parents = dedup(schedule_targets[x] for x in lsi.inputs if x in schedule_targets)
     for x in scheduled_parents:
+      if x in assign_kernels: raise Exception()
       graph[x].append(lsi)
       in_degree[lsi] += 1
     """
