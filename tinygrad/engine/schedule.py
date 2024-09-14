@@ -72,9 +72,10 @@ def _recursive_uop(buf:LazyBuffer, st:ShapeTracker, outputs:Tuple[LazyBuffer, ..
 
   # elementwise ops pass shapetracker
   in_uops = tuple(_recursive_uop(x, st, outputs, var_vals, inputs, realizes, assign_targets, cache) for x in buf.srcs)
-  if buf.op in {MetaOps.CONTIGUOUS, MetaOps.ASSIGN}:
+  if buf.op is MetaOps.CONTIGUOUS:
     assert buf in outputs, f"{buf.op} must be writable"
     return in_uops[0]
+  if buf.op is MetaOps.ASSIGN: return cache.setdefault((buf, st), UOp(UOps.ASSIGN, dtype, in_uops))
   if buf.op is UnaryOps.CAST: return cache.setdefault((buf, st), UOp(UOps.CAST, dtype, in_uops))
   if buf.op is UnaryOps.BITCAST: return cache.setdefault((buf, st), UOp(UOps.BITCAST, dtype, in_uops))
   return cache.setdefault((buf, st), UOp(UOps.ALU, dtype, in_uops, buf.op))
@@ -392,6 +393,8 @@ def _graph_schedule(outs:List[LazyBuffer]) -> \
 
 # *** DAG ordering: breadth first search ***
 
+no_assign = PatternMatcher([(UPat(UOps.ASSIGN, name="root"), lambda root:root.src[0])])
+
 def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem], Dict[Variable, int]]:
   graph, in_degree, var_vals = _graph_schedule(outs)
   if getenv("RUN_PROCESS_REPLAY") and getenv("COMPARE_SCHEDULE", 1):
@@ -402,7 +405,7 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   schedule: List[ScheduleItem] = []
   while queue:
     lsi = queue.popleft()
-    schedule.append(lsi)
+    schedule.append(ScheduleItem(graph_rewrite(lsi.ast, no_assign), lsi.bufs, lsi.metadata))
     for x in graph[lsi]:
       in_degree[x] -= 1
       if in_degree[x] == 0: queue.append(x)
