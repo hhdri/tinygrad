@@ -25,6 +25,7 @@ def load_T5(max_length:int = 12):
 
 model_tg = load_T5()
 
+# text = "translate English to German: Hello, how is you?"
 encoded_tg = model_tg(text).numpy()
 
 np.testing.assert_allclose(encoded_pt, encoded_tg, atol=1e-4)

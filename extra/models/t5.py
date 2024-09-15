@@ -17,6 +17,7 @@
 """Tinygrad T5 model."""
 
 import math
+import copy
 
 from dataclasses import dataclass
 from typing import List, Union
@@ -26,70 +27,10 @@ from tinygrad import nn, Tensor, dtypes
 from sentencepiece import SentencePieceProcessor
 
 
-'''
-{
-  "architectures": [
-    "T5ForConditionalGeneration"
-  ],
-  "d_ff": 2048,
-  "d_kv": 64,
-  "d_model": 768,
-  "decoder_start_token_id": 0,
-  "dropout_rate": 0.1,
-  "eos_token_id": 1,
-  "feed_forward_proj": "gated-gelu",
-  "initializer_factor": 1.0,
-  "is_encoder_decoder": true,
-  "layer_norm_epsilon": 1e-06,
-  "model_type": "t5",
-  "n_positions": 512,
-  "num_decoder_layers": 12,
-  "num_heads": 12,
-  "num_layers": 12,
-  "output_past": true,
-  "pad_token_id": 0,
-  "relative_attention_max_distance": 128,
-  "relative_attention_num_buckets": 32,
-  "task_specific_params": {
-    "summarization": {
-      "early_stopping": true,
-      "length_penalty": 2.0,
-      "max_length": 200,
-      "min_length": 30,
-      "no_repeat_ngram_size": 3,
-      "num_beams": 4,
-      "prefix": "summarize: "
-    },
-    "translation_en_to_de": {
-      "early_stopping": true,
-      "max_length": 300,
-      "num_beams": 4,
-      "prefix": "translate English to German: "
-    },
-    "translation_en_to_fr": {
-      "early_stopping": true,
-      "max_length": 300,
-      "num_beams": 4,
-      "prefix": "translate English to French: "
-    },
-    "translation_en_to_ro": {
-      "early_stopping": true,
-      "max_length": 300,
-      "num_beams": 4,
-      "prefix": "translate English to Romanian: "
-    }
-  },
-  "tie_word_embeddings": false,
-  "transformers_version": "4.23.1",
-  "use_cache": true,
-  "vocab_size": 32128
-}
-
-'''
-
 # default config is flan-t5-base
 @dataclass
 class T5Config:
+  is_decoder: bool | None = None # TODO: Fix this
   d_ff: int = 2048
   d_kv: int = 64
   d_model: int = 768
@@ -302,28 +243,47 @@ class T5LayerSelfAttention:
     attention_output, position_bias = self.SelfAttention(normed_hidden_states, position_bias=position_bias)
     hidden_states = hidden_states + attention_output
     return hidden_states, position_bias
+  
+class T5LayerCrossAttention:
+  def __init__(self, config:T5Config, has_relative_attention_bias:bool=False):
+    self.EncDecAttention = T5Attention(config, has_relative_attention_bias=has_relative_attention_bias)
+    self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+
+  def __call__(self, hidden_states:Tensor, position_bias:Tensor | None=None) -> tuple[Tensor, Tensor]:
+    normed_hidden_states = self.layer_norm(hidden_states)
+    attention_output, position_bias = self.EncDecAttention(normed_hidden_states, position_bias=position_bias)
+    hidden_states = hidden_states + attention_output
+    return hidden_states, position_bias
 
 
 class T5Block:
   def __init__(self, config:T5Config, has_relative_attention_bias:bool=False):
+    self.is_decoder = config.is_decoder
     self.layer = []
     self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias))
+    if self.is_decoder:
+      self.layer.append(T5LayerCrossAttention(config))
     self.layer.append(T5LayerFF(config))
 
-  def __call__(self, hidden_states:Tensor, position_bias:Tensor | None=None) -> tuple[Tensor, Tensor]:
-    self_attention_outputs, position_bias = self.layer[0](hidden_states, position_bias=position_bias)
+  def __call__(self, hidden_states:Tensor, position_bias:Tensor | None=None, encoder_decoder_position_bias:Tensor | None=None) -> tuple[Tensor, Tensor]:
+    self_attention_outputs, self_attention_position_bias = self.layer[0](hidden_states, position_bias=position_bias)
     hidden_states = self_attention_outputs
+
+    cross_attention_position_bias = None
+    if self.is_decoder:
+      hidden_states, cross_attention_position_bias = self.layer[1](hidden_states, position_bias=encoder_decoder_position_bias)
 
     # Apply Feed Forward layer
     hidden_states = self.layer[-1](hidden_states)
 
-    return hidden_states, position_bias
+    return hidden_states, self_attention_position_bias, cross_attention_position_bias
 
 
 class T5Stack:
   def __init__(self, config:T5Config, embed_tokens:nn.Embedding | None=None):
     self.config = config
     self.embed_tokens = embed_tokens
+    self.is_decoder = config.is_decoder
     self.block = [T5Block(config, has_relative_attention_bias=bool(i == 0)) for i in range(config.num_layers)]
     self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
 
@@ -334,11 +294,12 @@ class T5Stack:
     inputs_embeds = self.embed_tokens(input_ids)
 
     position_bias = None
+    encoder_decoder_position_bias = None
 
     hidden_states = inputs_embeds
 
     for layer_module in self.block:
-      hidden_states, position_bias = layer_module(hidden_states, position_bias=position_bias)
+      hidden_states, position_bias, encoder_decoder_position_bias = layer_module(hidden_states, position_bias=position_bias, encoder_decoder_position_bias=encoder_decoder_position_bias)
 
     return self.final_layer_norm(hidden_states)
 
@@ -351,6 +312,22 @@ class T5EncoderModel:
 
   def __call__(self, input_ids:Tensor) -> Tensor:
     return self.encoder(input_ids)
+  
+class T5Model:
+  def __init__(self, config:T5Config):
+      self.shared = nn.Embedding(config.vocab_size, config.d_model)
+      encoder_config = copy.deepcopy(config)  # TODO: Fix this (wrpaper)
+      encoder_config.is_decoder = False
+      self.encoder = T5Stack(encoder_config, self.shared)
+      decoder_config = copy.deepcopy(config)  # TODO: Fix this (wrpaper)
+      decoder_config.is_decoder = True
+      decoder_config.num_layers = config.num_decoder_layers
+      self.decoder = T5Stack(decoder_config, self.shared)
+
+  def __call__(self, input_ids:Tensor) -> Tensor:
+    encoder_outputs = self.encoder(input_ids)
+    decoder_outputs = self.decoder(input_ids)
+    return encoder_outputs, decoder_outputs
 
 class T5Embedder:
   def __init__(self, max_length:int, spiece_path:str):
