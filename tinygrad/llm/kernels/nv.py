@@ -173,7 +173,9 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
   q4 = ggml_type == Q4_K
   group_size, words = (32, 36) if q4 else (16, 105)
   groups = 64//group_size
-  row_tiles = _tile(out_features//16, 4, 2, 1)
+  # Q6_K's k16 fragments and per-16 coefficients need more registers per MMA; with a long K (e.g. FFN down, 12288 -> 4096) 32 rows
+  # per warp leave room to hide latency (10% faster there), while short-K shapes keep the larger tile
+  row_tiles = _tile(out_features//16, *((2, 1) if not q4 and in_features > out_features else (4, 2, 1)))
   row_warps = _tile(out_features//(16*row_tiles), 2, 1)
   token_tiles = _tile(tokens//8, 4, 2, 1)
   token_warps = _tile(tokens//(8*token_tiles), 4, 2, 1)
