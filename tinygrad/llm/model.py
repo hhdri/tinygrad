@@ -112,6 +112,11 @@ class TransformerConfig:
   sliding_window: int = 0
   sliding_window_pattern: int = 0
 
+def _silu_gate(gate:Tensor) -> Tensor:
+  # TODO: remove the need for this contiguous. A lazy gate matmul needs its own kernel (fused into the up/down product it is much
+  # slower); a gate that is already a buffer (custom kernel output) is cheaper fused into its consumer
+  return gate.silu() if gate.uop.base.has_buffer_identity(after_ok=True) else gate.silu().contiguous()
+
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
     self.config = config
@@ -162,12 +167,11 @@ class FFNBlock:
       x_down = self.ffn_down_exps(sel, act.contiguous())  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
-        shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
+        shexp = self.ffn_down_shexp(_silu_gate(self.ffn_gate_shexp(x)) * self.ffn_up_shexp(x))
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out
-    # TODO: remove the need for this contiguous
-    return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
+    return self.ffn_down(_silu_gate(self.ffn_gate(x)) * self.ffn_up(x))
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
