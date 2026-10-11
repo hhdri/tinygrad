@@ -104,6 +104,24 @@ class TestTensorCores(unittest.TestCase):
           result = np.frombuffer(bufs[0].as_memoryview(), np.int32).reshape(m,n)
           np.testing.assert_array_equal(result, a.astype(np.int32) @ b.astype(np.int32))
 
+  @unittest.skipUnless(Device.DEFAULT in ("NV", "CUDA"), "test requires CUDA integer tensor cores")
+  def test_cuda_wmma_bitcast_fragments(self):
+    # packed quantized kernels build int8 fragments from whole 32-bit words instead of stacking bytes
+    if int(Device[Device.DEFAULT].renderer.target.arch[3:]) < 80: self.skipTest("SM80 required")
+    def kernel(out:UOp, a:UOp, b:UOp) -> UOp:
+      lane = UOp.range(32, -1, AxisType.WARP)
+      g, t = lane//4, lane%4
+      afrag = UOp.stack(*(a[g+(i%2)*8, t+(i//2)*4].load() for i in range(4))).bitcast(dtypes.int8)
+      bfrag = UOp.stack(*(b[g, t+i*4].load() for i in range(2))).bitcast(dtypes.int8)
+      acc = UOp.wmma(afrag, bfrag, UOp.stack(*(UOp.const(0, dtypes.int32) for _ in range(4))), (8,16,32), 32)
+      stores = [out[g+(i//2)*8, t*2+i%2].store(acc[i]) for i in range(4)]
+      return UOp.group(*stores).end(lane).sink(arg=KernelInfo(name="wmma_bitcast", opts_to_apply=()))
+    rng = np.random.default_rng(0)
+    a, b = rng.integers(-128, 128, (16,32), dtype=np.int8), rng.integers(-128, 128, (8,32), dtype=np.int8)
+    a[0], b[:, 0] = -128, 127
+    out = Tensor.custom_kernel(Tensor.empty(16, 8, dtype=dtypes.int32), Tensor(a.view(np.uint32)), Tensor(b.view(np.uint32)), fxn=kernel)[0]
+    np.testing.assert_array_equal(out.numpy(), a.astype(np.int32) @ b.T.astype(np.int32))
+
   def test_tensor_cores_fp8_signed(self):
     for i, tc in enumerate(Device[Device.DEFAULT].renderer.tensor_cores):
       if tc.dtype_in not in dtypes.fp8s: continue
