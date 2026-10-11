@@ -11,6 +11,7 @@ from tinygrad.renderer.cstyle import CUDARenderer
 Q4_K, Q6_K = 12, 14
 NV_QUANTS = {Q4_K: 144, Q6_K: 210}  # bytes per 256 weights
 ROWS_PER_BLOCK = 4
+MAGIC = 12582912.0  # 1.5*2**23
 
 @functools.cache
 def nv_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
@@ -270,12 +271,20 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
                UOp.stack(*((w[0] >> (i*8)).cast(dtypes.uint8).bitcast(dtypes.int8) for i in range(4))) for w in b_words]
     coeffs = [[c_s[cur, sub, wrow+r*16+g+h*8, k].load() for k in range(2 if q4 else 1)] for r in range(row_tiles) for h in range(2)]
     terms = [[t_s[cur, sub, wtok+j*8+t*2+i, k].load() for k in range(2 if q4 else 1)] for j in range(token_tiles) for i in range(2)]
+    # Q4_K: int->float conversion is quarter rate, so the MMA accumulator starts at the bits of MAGIC, its int32 result reads as
+    # MAGIC+dot in float (exact for |dot| < 2**22), and fma(MAGIC+dot, c, -MAGIC*c) == dot*c exactly. Slower for Q6_K.
+    seed = UOp.stack(*(UOp.const(0x4b400000 if q4 else 0, dtypes.int32) for _ in range(4)))
+    biases = [c[0]*-MAGIC for c in coeffs]
     for r, a in enumerate(a_frags):
       for j, b in enumerate(b_frags):
-        dot = UOp.wmma(a, b, UOp.stack(*(UOp.const(0, dtypes.int32) for _ in range(4))), (8,16,group_size), 32)
+        dot = UOp.wmma(a, b, seed, (8,16,group_size), 32)
         for i in range(4):
           c, tt, v = coeffs[r*2+i//2], terms[j*2+i%2], (r*token_tiles+j)*4+i
-          values[v] = values[v] + c[0]*dot[i].float()*tt[0] + (c[1]*tt[1] if q4 else 0)
+          # an explicit fmaf: the symbolic rewriter may otherwise distribute the product and lose the exact cancellation
+          if q4:
+            scaled = _custom("fmaf({0}, {1}, {2})", dtypes.float32, dot[i].bitcast(dtypes.float32), c[0], biases[r*2+i//2])
+            values[v] = scaled*tt[0] + (c[1]*tt[1] + values[v])
+          else: values[v] = values[v] + c[0]*dot[i].float()*tt[0]
   update = UOp.group(acc.store(UOp.stack(*values)), *stores).end(stage)
   outs = [out[tok0+wtok+j*8+t*2+i%2, row0+wrow+r*16+g+(i//2)*8].store(acc.after(update)[(r*token_tiles+j)*4+i].load())
           for r in range(row_tiles) for j in range(token_tiles) for i in range(4)]
