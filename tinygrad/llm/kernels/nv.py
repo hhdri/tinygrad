@@ -126,3 +126,23 @@ def nv_q8_linear(weight:Tensor, ggml_type:int, x:Tensor, in_features:int, out_fe
   fxn = functools.partial(_q4k_gemv_kernel if ggml_type == Q4_K else _q6k_gemv_kernel, tokens=tokens, out_features=out_features,
                           in_features=in_features)
   return Tensor.custom_kernel(out, weight, *q8_quantize(x, tokens, in_features), fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
+
+# ******** dense decode ********
+
+@functools.cache
+def _f16_gemv_kernel(out:UOp, weight:UOp, x:UOp, in_features:int, out_features:int) -> UOp:
+  row_block, lane, warp = UOp.range(out_features//ROWS_PER_BLOCK, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP), \
+    UOp.range(ROWS_PER_BLOCK, 2, AxisType.LOCAL)
+  row = row_block*ROWS_PER_BLOCK + warp
+  acc = UOp.const(0, dtypes.float32)
+  for step in range(in_features//256):
+    idx = step*256 + lane*8
+    w, v = _vload(weight, row*in_features + idx, 8), _vload(x, idx, 8)
+    for j in range(8): acc = acc + w[j].float()*v[j].float()
+  return out[row.valid(lane.eq(0))].store(warp_reduce(acc)).end(row_block, lane, warp).sink(
+    arg=KernelInfo(name="nv_f16_gemv", opts_to_apply=()))
+
+def nv_f16_gemv(weight:Tensor, x:Tensor, in_features:int, out_features:int) -> Tensor:
+  out = Tensor.empty(out_features, dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(_f16_gemv_kernel, in_features=in_features, out_features=out_features)
+  return Tensor.custom_kernel(out, weight.contiguous(), x.contiguous(), fxn=fxn)[0].reshape(*x.shape[:-1], out_features)

@@ -7,7 +7,7 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -116,6 +116,14 @@ class Linear(nn.Linear):
       # keep the lazy dequantization for the shapes the packed kernels don't cover
       self.dense = self.weight
       if isinstance(self.weight.device, str): self.set_quantized(self.weight, (Q4_K, Q6_K))
+      # Dense storage only: unsupported packed formats must keep their fused dequantization fallback.
+      if self.ggml_type is None and (weight:=_view_back(self.weight)).dtype == dtypes.float16 and weight.uop.contiguous_view() is not None \
+        and self.weight.uop.axis is None \
+        and self.in_features % 256 == 0 and self.out_features % 4 == 0:
+        if isinstance(numel:=x.numel(), int) and numel == self.in_features:
+          out = nv_f16_gemv(weight, x, self.in_features, self.out_features)
+          return out if self.bias is None else out + self.bias
+        return super().__call__(x)
       if not nv_linear_supported(self.ggml_type, self.in_features, self.out_features):
         self.use_custom_quant, self.weight, self.ggml_type = False, self.dense, None
         return super().__call__(x)

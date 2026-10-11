@@ -120,6 +120,29 @@ class TestNVQuantLinear(unittest.TestCase):
   def setUp(self):
     if not nv_custom_kernels_supported(Device.DEFAULT): self.skipTest("NV or CUDA (sm_61+) required")
 
+  def test_dense_decode(self):
+    rng = np.random.default_rng(3)
+    for k, n in ((256, 4), (4096, 64), (4096, 1024), (768, 7), (384, 4)):
+      for dtype in (np.float16, np.float32):
+        with self.subTest(k=k, n=n, dtype=dtype):
+          weight = rng.normal(size=(n, k)).astype(np.float16)
+          linear = Linear(k, n, bias=True)
+          linear.weight = Tensor(weight).cast(dtypes.float32)
+          bias = rng.normal(size=n).astype(np.float32)
+          linear.bias = Tensor(bias)
+          for tokens in (1, 3):
+            x = rng.normal(size=(1, tokens, k)).astype(dtype)
+            np.testing.assert_allclose(linear(Tensor(x)).numpy(), x.astype(np.float32) @ weight.astype(np.float32).T + bias,
+                                       rtol=2e-4, atol=2e-4)
+          np.testing.assert_allclose(linear(Tensor.zeros(1, k)).numpy(), bias[None], atol=1e-6)
+
+  def test_dense_extreme_values(self):
+    weight = np.tile(np.array([65504, -65504, 6e-8, -6e-8], np.float16), (4, 64))
+    linear = Linear(256, 4, bias=False)
+    linear.weight = Tensor(weight)
+    x = np.tile(np.array([1, -1, 1e-3, -1e-3], np.float32), (1, 64))
+    np.testing.assert_allclose(linear(Tensor(x)).numpy(), x @ weight.astype(np.float32).T, rtol=1e-6)
+
   def _check(self, ggml_type:int, in_features:int, out_features:int, d:float, dmin:float, x:np.ndarray, offset:int=0):
     rng = np.random.default_rng(ggml_type)
     packed = rng.integers(0, 256, (out_features*in_features//256, QUANT_SIZES[ggml_type]), dtype=np.uint8)
