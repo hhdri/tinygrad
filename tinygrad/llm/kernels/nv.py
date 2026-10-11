@@ -39,6 +39,7 @@ def _dp4a(a:UOp, b:UOp, c:UOp) -> UOp: return _custom("__dp4a({0}, {1}, {2})", d
 def _vload(buf:UOp, idx:UOp, lanes:int) -> list[UOp]:
   vec = UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(lanes))).load()
   return [vec[i] for i in range(lanes)]
+def _fma(a:UOp, b:UOp, c:UOp) -> UOp: return _custom("fmaf({0}, {1}, {2})", dtypes.float32, a, b, c)
 def _half(bits:UOp) -> UOp: return bits.cast(dtypes.uint16).bitcast(dtypes.float16).float()
 def _u32(raw:UOp, idx:UOp) -> UOp: return raw[idx].load().cast(dtypes.uint32) | (raw[idx+1].load().cast(dtypes.uint32) << 16)
 
@@ -282,11 +283,13 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
         dot = UOp.wmma(a, b, seed, (8,16,group_size), 32)
         for i in range(4):
           c, tt, v = coeffs[r*2+i//2], terms[j*2+i%2], (r*token_tiles+j)*4+i
-          # an explicit fmaf: the symbolic rewriter may otherwise distribute the product and lose the exact cancellation
+          # explicit fmafs: the symbolic rewriter may otherwise distribute the magic product and lose the exact cancellation, and
+          # the accumulation is an explicit fmaf chain too: as a plain sum the rewriter reorders the terms of a stage and puts the
+          # accumulator last, which costs an extra FMUL and FADD per output
           if q4:
-            scaled = _custom("fmaf({0}, {1}, {2})", dtypes.float32, dot[i].bitcast(dtypes.float32), c[0], biases[r*2+i//2])
-            values[v] = scaled*tt[0] + (c[1]*tt[1] + values[v])
-          else: values[v] = values[v] + c[0]*dot[i].float()*tt[0]
+            scaled = _fma(dot[i].bitcast(dtypes.float32), c[0], biases[r*2+i//2])
+            values[v] = _fma(scaled, tt[0], _fma(c[1], tt[1], values[v]))
+          else: values[v] = values[v] + c[0]*dot[i].float()*tt[0]  # Q6_K is latency bound: a strict chain was up to 12% slower
   update = UOp.group(acc.store(UOp.stack(*values)), *stores).end(stage)
   outs = [out[tok0+wtok+j*8+t*2+i%2, row0+wrow+r*16+g+(i//2)*8].store(acc.after(update)[(r*token_tiles+j)*4+i].load())
           for r in range(row_tiles) for j in range(token_tiles) for i in range(4)]
