@@ -123,7 +123,8 @@ class TestNVQuantLinear(unittest.TestCase):
   def test_mmq(self):
     if int(Device[Device.DEFAULT].renderer.target.arch[3:]) < 80: self.skipTest("SM80 required")
     rng = np.random.default_rng(42)
-    for typ,(k,n,t) in itertools.product((12,14), ((256,16,8), (1024,32,16), (256,16,3))):
+    # shapes cover 1-4 row and token tiles per warp, 1-2 row and 1-4 token warps per block, and padded tokens
+    for typ,(k,n,t) in itertools.product((12,14), ((256,16,8), (1024,32,16), (256,16,3), (512,128,128), (256,48,40))):
       for d,dmin,zero in ((0.001,0.0002,False), (-0.01,-0.002,False), (0.001,0.0002,True)):
         with self.subTest(typ=typ, k=k, n=n, tokens=t, d=d, zero=zero):
           packed = rng.integers(0,256,(n*k//256,QUANT_SIZES[typ]),dtype=np.uint8)

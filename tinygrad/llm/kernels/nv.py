@@ -154,58 +154,123 @@ def nv_f16_gemv(weight:Tensor, x:Tensor, in_features:int, out_features:int) -> T
 
 # ******** prefill: integer tensor cores ********
 
+def _tile(n:int, *sizes:int) -> int: return next(s for s in sizes if n % s == 0)
+
 @functools.cache
 def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_features:int, in_features:int, ggml_type:int) -> UOp:
-  group_size = 32 if ggml_type == Q4_K else 16
-  token_tiles = 2 if tokens % 16 == 0 else 1
-  tile, lane = UOp.range((tokens//(8*token_tiles))*(out_features//16), 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
-  row_base, token_base = (tile%(out_features//16))*16, (tile//(out_features//16))*(8*token_tiles)
-  acc = UOp.alloc((4*token_tiles,), dtypes.float32, addrspace=AddrSpace.REG)
+  # Each warp owns row_tiles 16-row x token_tiles 8-token MMA tiles, so every weight fragment feeds token_tiles MMAs and every
+  # activation fragment row_tiles MMAs. The block stages 64 weights per row at a time: it unpacks its rows to int8 words in
+  # shared memory, decodes each row's group coefficients once, and stages the activations next to them.
+  # Q4_K groups (32) match m16n8k32; Q6_K scales every 16 weights, so it uses m16n8k16.
+  q4 = ggml_type == Q4_K
+  group_size, words = (32, 36) if q4 else (16, 105)
+  groups = 64//group_size
+  row_tiles = _tile(out_features//16, 4, 2, 1)
+  row_warps = _tile(out_features//(16*row_tiles), 2, 1)
+  token_tiles = _tile(tokens//8, 4, 2, 1)
+  token_warps = _tile(tokens//(8*token_tiles), 4, 2, 1)
+  TN, TM, threads = 16*row_tiles*row_warps, 8*token_tiles*token_warps, 32*row_warps*token_warps
+  token_blocks = tokens//TM
+  block, lane = UOp.range(token_blocks*(out_features//TN), 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
+  warp = UOp.range(row_warps*token_warps, 2, AxisType.LOCAL)
+  tid, g, t = warp*32+lane, lane//4, lane%4
+  row0, tok0 = (block//token_blocks)*TN, (block%token_blocks)*TM
+  wrow, wtok = (warp//token_warps)*(16*row_tiles), (warp%token_warps)*(8*token_tiles)
+  # 20-word rows: the fragment reads of 8 rows x 4 words fall in distinct banks, and 16-byte stores stay aligned
+  # double buffered: iteration s computes from buffer s%2 while it stages s+1 into the other one; the barrier that ends each
+  # iteration orders both the stores before the next iteration's reads and the reads before the stores that overwrite them
+  w_s = UOp.alloc((2, TN, 20), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  x_s = UOp.alloc((2, TM, 20), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  # Q4_K: (scale*d, min*dmin) per row and (d, -(sum of quants)*d) per token; Q6_K: scale*d and d
+  c_s = UOp.alloc((2, groups, TN, 2 if q4 else 1), dtypes.float32, addrspace=AddrSpace.LOCAL)
+  t_s = UOp.alloc((2, groups, TM, 2 if q4 else 1), dtypes.float32, addrspace=AddrSpace.LOCAL)
+  acc = UOp.alloc((row_tiles*token_tiles*4,), dtypes.float32, addrspace=AddrSpace.REG)
   acc = acc.after(acc.store(acc.const_like(0)))
-  group = UOp.range(in_features//group_size, 1, AxisType.LOOP)
-  block, subgroup = group//(256//group_size), group%(256//group_size)
+  stages = in_features//64
 
-  def weight_base(row): return (row*(in_features//256)+block)*(36 if ggml_type == Q4_K else 105)
-  def quant(row, k):
-    if ggml_type == Q6_K:
-      y = subgroup*16+k
-      low = raw[weight_base(row)+(y//128)*32+(y%64)//2].load()
-      low = (low >> ((y%2)*8+(y%128//64)*4).cast(dtypes.uint16)) & 15
-      high = raw[weight_base(row)+64+(y//128)*16+(y%32)//2].load()
-      high = (high >> ((y%2)*8+(y%128//32)*2).cast(dtypes.uint16)) & 3
-      return ((low | (high << 4)).cast(dtypes.int32)-32).cast(dtypes.int8)
-    byte = (subgroup//2)*32+k
-    word = raw[weight_base(row)+4+byte//4].load()
-    return ((word >> ((byte%4)*8+(subgroup%2)*4).cast(dtypes.uint32)) & 15).cast(dtypes.int8)
+  def stage_stores(stage:UOp, buf:UOp|int) -> list[UOp]:
+    sb, part = stage//4, stage%4
+    stores:list[UOp] = []
+    def coop(n:int, fn) -> None:
+      # spread n items over the block's threads; a partial last round masks its stores
+      for i in range((n+threads-1)//threads):
+        idx = tid+i*threads
+        stores.extend(fn(idx.minimum(n-1) if n % threads else idx, idx < n if n % threads else None))
+    def masked(i:UOp, valid:UOp|None) -> UOp: return i if valid is None else i.valid(valid)
+    def row_base(r:UOp) -> UOp: return ((row0+r)*(in_features//256)+sb)*words
 
-  # m16n8k16/32: A owns two rows and two K halves; B owns one token and two K halves.
-  a = UOp.stack(*(quant(row_base+lane//4+((i//4)%2)*8, (lane%4)*4+i%4+(i//8)*16) for i in range(group_size//2)))
-  values = []
-  for j in range(token_tiles):
-    token_b = token_base+j*8+lane//4
-    b = UOp.stack(*((xq[token_b, group*(group_size//4)+lane%4+(i//4)*4].load() >> ((i%4)*8)).cast(dtypes.uint8).bitcast(dtypes.int8)
-                    for i in range(group_size//4)))
-    dot = UOp.wmma(a, b, UOp.stack(*(UOp.const(0, dtypes.int32) for _ in range(4))), (8,16,group_size), 32)
-    for i in range(4):
-      row, token = row_base+lane//4+(i//2)*8, token_base+j*8+(lane%4)*2+i%2
-      base = weight_base(row)
-      if ggml_type == Q6_K:
-        scale = (raw[base+96+subgroup//2].load() >> ((subgroup%2)*8).cast(dtypes.uint16)).cast(dtypes.uint8).bitcast(dtypes.int8).float()
-        value = _half(raw[base+104].load())*scale*dot[i].float()*xd[token, group//2].load()
-        values.append(acc.after(group)[j*4+i].load()+value)
-        continue
-      head, s0, s1, s2 = _vload(raw, base, 4)
-      shift = ((subgroup%4)*8).cast(dtypes.uint32)
-      v0, v1, v2 = ((v >> shift) & 255 for v in (s0,s1,s2))
-      scale = (subgroup < 4).where(v0 & 63, (v2 & 15) | ((v0 >> 6) << 4)).float()
-      minimum = (subgroup < 4).where(v1 & 63, (v2 >> 4) | ((v1 >> 6) << 4)).float()
-      value = (_half(head & 65535)*scale*dot[i].float() - _half(head >> 16)*minimum*
-               (xs[token, group*2].load()+xs[token, group*2+1].load()))*xd[token, group].load()
-      values.append(acc.after(group)[j*4+i].load()+value)
-  update = acc.store(UOp.stack(*values)).end(group)
-  stores = [out[token_base+j*8+(lane%4)*2+i%2, row_base+lane//4+(i//2)*8].store(acc.after(update)[j*4+i].load())
-            for j in range(token_tiles) for i in range(4)]
-  return UOp.group(*stores).end(tile, lane).sink(arg=KernelInfo(name="q4k_mmq" if ggml_type == Q4_K else "q6k_mmq", opts_to_apply=()))
+    if q4:
+      def weights(i, v):
+        r, quarter = i//2, i%2
+        qs = _vload(raw, row_base(r)+4+part*8+quarter*4, 4)
+        return [w_s[buf, masked(r, v), h*8+quarter*4+k].store((qs[k] >> (h*4)) & 0x0f0f0f0f) for h in range(2) for k in range(4)]
+      coop(TN*2, weights)
+      def coefficients(i, v):
+        sub, r = i//TN, i%TN
+        head, s0, s1, s2 = _vload(raw, row_base(r), 4)
+        a, b, c = ((x >> (((part*2+sub)%4)*8).cast(dtypes.uint32)) & 255 for x in (s0, s1, s2))
+        low = part < 2
+        scale, minimum = low.where(a & 63, (c & 15) | ((a >> 6) << 4)), low.where(b & 63, (c >> 4) | ((b >> 6) << 4))
+        return [c_s[buf, sub, masked(r, v), 0].store(_half(head & 0xffff)*scale.float()),
+                c_s[buf, sub, masked(r, v), 1].store(_half(head >> 16)*minimum.float())]
+      coop(TN*groups, coefficients)
+    else:
+      def weights(i, v):
+        r, w = i//16, i%16
+        n, q, l = part//2, (part%2)*2+w//8, (w%8)*4
+        ql, qh = _u32(raw, row_base(r)+(n*64+(q%2)*32+l)//2), _u32(raw, row_base(r)+64+(n*32+l)//2)
+        word = ((ql >> ((q//2)*4).cast(dtypes.uint32)) & 0x0f0f0f0f) | (((qh >> (q*2).cast(dtypes.uint32)) & 0x03030303) << 4)
+        # bytewise q-32 without borrows: clearing bit 5 subtracts 32 from q >= 32, q < 32 also gets the sign bits 0xc0
+        return [w_s[buf, masked(r, v), w].store((word ^ 0x20202020) | (((word ^ 0xffffffff) & 0x20202020) * 6))]
+      coop(TN*16, weights)
+      def coefficients(i, v):
+        sub, r = i//TN, i%TN
+        s16 = part*4+sub
+        scale = (raw[row_base(r)+96+s16//2].load() >> ((s16%2)*8).cast(dtypes.uint16)).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+        return [c_s[buf, sub, masked(r, v), 0].store(_half(raw[row_base(r)+104].load())*scale)]
+      coop(TN*groups, coefficients)
+    def activations(i, v):
+      tk, quarter = i//4, i%4
+      x = _vload(xq, (tok0+tk)*(in_features//4)+stage*16+quarter*4, 4)
+      return [x_s[buf, masked(tk, v), quarter*4+k].store(x[k]) for k in range(4)]
+    coop(TM*4, activations)
+    def token_terms(i, v):
+      sub, tk = i//TM, i%TM
+      tok, grp = tok0+tk, stage*groups+sub
+      if not q4: return [t_s[buf, sub, masked(tk, v), 0].store(xd[tok, grp//2].load())]
+      d = xd[tok, grp].load()
+      total = xs[tok, grp*2].load()+xs[tok, grp*2+1].load()
+      return [t_s[buf, sub, masked(tk, v), 0].store(d), t_s[buf, sub, masked(tk, v), 1].store(-total*d)]
+    coop(TM*groups, token_terms)
+    return stores
+
+  prologue = stage_stores(UOp.const(0, dtypes.weakint), 0)
+  stage = UOp.range(stages, 1, AxisType.LOOP)
+  cur = stage%2
+  # the last iteration restages its own (clamped) stage into the idle buffer, which nothing reads
+  stores = stage_stores((stage+1).minimum(stages-1), 1-cur)
+  w_s, x_s, c_s, t_s = (b.after(*prologue) for b in (w_s, x_s, c_s, t_s))
+  values = [acc.after(stage)[i].load() for i in range(row_tiles*token_tiles*4)]
+  wpg = group_size//4  # words per group
+  for sub in range(groups):
+    a_frags = [UOp.stack(*(w_s[cur, wrow+r*16+g+(i%2)*8, sub*wpg+t+(i//2)*4].load() for i in range(group_size//8))).bitcast(dtypes.int8)
+               for r in range(row_tiles)]
+    b_words = [[x_s[cur, wtok+j*8+g, sub*wpg+t+i*4].load() for i in range(group_size//16)] for j in range(token_tiles)]
+    # a scalar word bitcasts to a scalar, so m16n8k16's single B word is split into bytes
+    b_frags = [UOp.stack(*w).bitcast(dtypes.int8) if len(w) > 1 else
+               UOp.stack(*((w[0] >> (i*8)).cast(dtypes.uint8).bitcast(dtypes.int8) for i in range(4))) for w in b_words]
+    coeffs = [[c_s[cur, sub, wrow+r*16+g+h*8, k].load() for k in range(2 if q4 else 1)] for r in range(row_tiles) for h in range(2)]
+    terms = [[t_s[cur, sub, wtok+j*8+t*2+i, k].load() for k in range(2 if q4 else 1)] for j in range(token_tiles) for i in range(2)]
+    for r, a in enumerate(a_frags):
+      for j, b in enumerate(b_frags):
+        dot = UOp.wmma(a, b, UOp.stack(*(UOp.const(0, dtypes.int32) for _ in range(4))), (8,16,group_size), 32)
+        for i in range(4):
+          c, tt, v = coeffs[r*2+i//2], terms[j*2+i%2], (r*token_tiles+j)*4+i
+          values[v] = values[v] + c[0]*dot[i].float()*tt[0] + (c[1]*tt[1] if q4 else 0)
+  update = UOp.group(acc.store(UOp.stack(*values)), *stores).end(stage)
+  outs = [out[tok0+wtok+j*8+t*2+i%2, row0+wrow+r*16+g+(i//2)*8].store(acc.after(update)[(r*token_tiles+j)*4+i].load())
+          for r in range(row_tiles) for j in range(token_tiles) for i in range(4)]
+  return UOp.group(*outs).end(block, lane, warp).sink(arg=KernelInfo(name="q4k_mmq" if q4 else "q6k_mmq", opts_to_apply=()))
 
 def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type:int) -> Tensor:
   shape = x.shape[:-1]
