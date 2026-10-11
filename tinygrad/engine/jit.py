@@ -67,8 +67,21 @@ class CapturedJit(Generic[ReturnType]):
   def _symbolic_ret(self) -> list[tuple[Tensor, UOp, dict[Variable, int]]]:
     return [(t, *ub) for t in get_parameters(self.ret) if (ub:=t.uop.unbind_all())[1]]
 
+  @functools.cached_property
+  def _input_copies(self) -> dict[tuple[int, UOp], tuple[UOp, UOp]]: return {}
+
+  def _copy_input(self, i:int, u:UOp) -> UOp:
+    # an input aliasing a JIT buffer (e.g. the previous call's output fed back) is copied first. The copy into a destination kept per
+    # input slot is compiled and linked once, then replayed like the JIT itself.
+    if (cached:=self._input_copies.get((i, u))) is None:
+      if u.on_disk(): raise JitError("cannot make an independent copy of a written DISK input")
+      linear = UOp(Ops.LINEAR, src=((dst:=UOp.new_buffer(u.device, u.max_numel(), u.dtype)).store_call(u),))
+      cached = self._input_copies[(i, u)] = (dst, link_linear(compile_linear(linear, input_uops=[dst, u], cache=True), input_uops=[dst, u]))
+    run_linear(cached[1], input_uops=(cached[0], u), jit=True)
+    return cached[0]
+
   def __call__(self, input_uops:list[UOp], var_vals:dict[str, int]) -> ReturnType:
-    concrete = tuple(_copy_input(u) if u in self._jit_bufs else u for u in input_uops)
+    concrete = tuple(self._copy_input(i, u) if u in self._jit_bufs else u for i,u in enumerate(input_uops))
     if DEBUG >= 1 and len(self.linear.src) >= 10: print(f"jit execs {len(self.linear.src)} calls")
     run_linear(self.linear, var_vals, input_uops=concrete, jit=True)
     for t,u,vals in self._symbolic_ret: t.uop = u.substitute({v:v.bind(var_vals.get(v.expr, i)) for v,i in vals.items()}, walk=True)
