@@ -98,6 +98,9 @@ class Scheduler:
             f"invalid split arg {opt.arg}")
       if new_type is AxisType.LOCAL: check(self.ren.has_local, "locals needed for opt")
 
+      # a symbolic size can't be split exactly: pad it to a multiple of amt first, so one SPLIT action reaches the split
+      if amt != 0 and rng.src[0].op is not Ops.CONST and rng.src[0].divides(amt) is None:
+        rng = self.apply_opt(Opt(OptOps.PADTO, cast(int, opt.axis), amt), append_opt=False)
       if amt == 0: amt = int(rng.vmax+1)
       is_reduce = rng in self.reduce_ranges
       if new_type is AxisType.UPCAST:
