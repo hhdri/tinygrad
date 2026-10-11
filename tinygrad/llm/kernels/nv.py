@@ -176,7 +176,8 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
   groups = 64//group_size
   # Q6_K's k16 fragments and per-16 coefficients need more registers per MMA; with a long K (e.g. FFN down, 12288 -> 4096) 32 rows
   # per warp leave room to hide latency (10% faster there), while short-K shapes keep the larger tile
-  row_tiles = _tile(out_features//16, *((2, 1) if not q4 and in_features > out_features else (4, 2, 1)))
+  narrow = not q4 and in_features > out_features
+  row_tiles = _tile(out_features//16, *((2, 1) if narrow else (4, 2, 1)))
   row_warps = _tile(out_features//(16*row_tiles), 2, 1)
   token_tiles = _tile(tokens//8, 4, 2, 1)
   token_warps = _tile(tokens//(8*token_tiles), 4, 2, 1)
@@ -274,9 +275,11 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
                UOp.stack(*((w[0] >> (i*8)).cast(dtypes.uint8).bitcast(dtypes.int8) for i in range(4))) for w in b_words]
     coeffs = [[c_s[cur, sub, wrow+r*16+g+h*8, k].load() for k in range(2 if q4 else 1)] for r in range(row_tiles) for h in range(2)]
     terms = [[t_s[cur, sub, wtok+j*8+t*2+i, k].load() for k in range(2 if q4 else 1)] for j in range(token_tiles) for i in range(2)]
-    # Q4_K: int->float conversion is quarter rate, so the MMA accumulator starts at the bits of MAGIC, its int32 result reads as
-    # MAGIC+dot in float (exact for |dot| < 2**22), and fma(MAGIC+dot, c, -MAGIC*c) == dot*c exactly. Slower for Q6_K.
-    seed = UOp.stack(*(UOp.const(0x4b400000 if q4 else 0, dtypes.int32) for _ in range(4)))
+    # int->float conversion is quarter rate, so the MMA accumulator starts at the bits of MAGIC, its int32 result reads as MAGIC+dot
+    # in float (exact for |dot| < 2**22), and fma(MAGIC+dot, c, -MAGIC*c) == dot*c exactly (c is an F16 scale times a small int).
+    # Q6_K's wide tile has no registers left for the biases (up to 4% slower there), so it keeps the conversion.
+    magic = q4 or narrow
+    seed = UOp.stack(*(UOp.const(0x4b400000 if magic else 0, dtypes.int32) for _ in range(4)))
     biases = [c[0]*-MAGIC for c in coeffs]
     for r, a in enumerate(a_frags):
       for j, b in enumerate(b_frags):
@@ -289,7 +292,8 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
           if q4:
             scaled = _fma(dot[i].bitcast(dtypes.float32), c[0], biases[r*2+i//2])
             values[v] = _fma(scaled, tt[0], _fma(c[1], tt[1], values[v]))
-          else: values[v] = values[v] + c[0]*dot[i].float()*tt[0]  # Q6_K is latency bound: a strict chain was up to 12% slower
+          elif magic: values[v] = values[v] + _fma(dot[i].bitcast(dtypes.float32), c[0], biases[r*2+i//2])*tt[0]
+          else: values[v] = values[v] + c[0]*dot[i].float()*tt[0]
   update = UOp.group(acc.store(UOp.stack(*values)), *stores).end(stage)
   outs = [out[tok0+wtok+j*8+t*2+i%2, row0+wrow+r*16+g+(i//2)*8].store(acc.after(update)[(r*token_tiles+j)*4+i].load())
           for r in range(row_tiles) for j in range(token_tiles) for i in range(4)]
