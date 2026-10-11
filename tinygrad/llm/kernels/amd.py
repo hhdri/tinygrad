@@ -122,8 +122,9 @@ class Linear(nn.Linear):
         and self.in_features % 256 == 0 and self.out_features % 4 == 0:
         if isinstance(numel:=x.numel(), int) and numel == self.in_features:
           out = nv_f16_gemv(weight, x, self.in_features, self.out_features)
-        # prefill: F16 activations with F32 accumulation run on tensor cores; F32 activations would promote the weight to F32
-        else: out = x.cast(dtypes.float16).matmul(weight.T, dtype=dtypes.float32)
+        # prefill: F16 activations with F32 accumulation run on tensor cores; F32 activations would promote the weight to F32.
+        # contiguous() turns the uint8 GGUF view into a zero-copy F16 buffer view: through the bitcast the matmul loaded bytes.
+        else: out = x.cast(dtypes.float16).matmul(weight.contiguous().T, dtype=dtypes.float32)
         return out if self.bias is None else out + self.bias
       if not nv_linear_supported(self.ggml_type, self.in_features, self.out_features):
         self.use_custom_quant, self.weight, self.ggml_type = False, self.dense, None
