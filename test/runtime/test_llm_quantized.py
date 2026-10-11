@@ -2,7 +2,7 @@ import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
@@ -119,6 +119,25 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
 class TestNVQuantLinear(unittest.TestCase):
   def setUp(self):
     if not nv_custom_kernels_supported(Device.DEFAULT): self.skipTest("NV or CUDA (sm_61+) required")
+
+  def test_mmq(self):
+    if int(Device[Device.DEFAULT].renderer.target.arch[3:]) < 80: self.skipTest("SM80 required")
+    rng = np.random.default_rng(42)
+    for typ,(k,n,t) in itertools.product((12,14), ((256,16,8), (1024,32,16), (256,16,3))):
+      for d,dmin,zero in ((0.001,0.0002,False), (-0.01,-0.002,False), (0.001,0.0002,True)):
+        with self.subTest(typ=typ, k=k, n=n, tokens=t, d=d, zero=zero):
+          packed = rng.integers(0,256,(n*k//256,QUANT_SIZES[typ]),dtype=np.uint8)
+          if typ == 12: packed[:,:4] = np.array([d,dmin],np.float16).view(np.uint8)
+          else: packed[:,-2:] = np.array([d],np.float16).view(np.uint8)
+          raw = Tensor(packed.ravel()).realize()
+          weight = ggml_data_to_tensor(raw,n*k,typ).reshape(n,k).numpy().astype(np.float64)
+          x = rng.normal(size=(t,k)).astype(np.float32)
+          if zero: x.fill(0)
+          grouped = x.reshape(t,-1,32)
+          scale = np.maximum(np.abs(grouped).max(-1,keepdims=True)/127,1e-30)
+          reference = (np.rint(grouped/scale)*scale).reshape(t,k).astype(np.float64) @ weight.T
+          actual = nv_mmq(raw.bitcast(dtypes.uint32 if typ == 12 else dtypes.uint16),Tensor(x),k,n,typ).numpy()
+          np.testing.assert_allclose(actual,reference,atol=2e-4,rtol=2e-4)
 
   def test_dense_decode(self):
     rng = np.random.default_rng(3)

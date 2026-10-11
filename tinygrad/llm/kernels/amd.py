@@ -7,7 +7,7 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv, nv_mmq
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -128,7 +128,12 @@ class Linear(nn.Linear):
         self.use_custom_quant, self.weight, self.ggml_type = False, self.dense, None
         return super().__call__(x)
     assert self.ggml_type is not None
-    if not isinstance(numel:=x.numel(), int) or numel != self.in_features: return x.linear(self.dense.T, self.bias)
+    numel = x.numel()
+    if isinstance(numel, int) and numel > self.in_features and self.out_features % 16 == 0 and isinstance(self.weight.device, str) \
+      and int(Device[self.weight.device].renderer.target.arch[3:]) >= 80:
+      out = nv_mmq(self.weight, x, self.in_features, self.out_features, self.ggml_type)
+      return out if self.bias is None else out + self.bias
+    if not isinstance(numel, int) or numel != self.in_features: return x.linear(self.dense.T, self.bias)
     out = nv_q8_linear(self.weight, self.ggml_type, x, self.in_features, self.out_features)
     return out if self.bias is None else out + self.bias
 

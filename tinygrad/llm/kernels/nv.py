@@ -2,7 +2,7 @@ from __future__ import annotations
 import functools
 from tinygrad import Tensor, UOp, Device, Context, dtypes
 from tinygrad.helpers import getenv
-from tinygrad.uop.ops import AxisType, KernelInfo, Ops
+from tinygrad.uop.ops import AxisType, KernelInfo, Ops, AddrSpace
 from tinygrad.renderer.cstyle import CUDARenderer
 
 # NVIDIA (sm_61+, dp4a) kernels over packed ggml weights, rendered by the CUDA C renderer for the NV and CUDA devices.
@@ -146,3 +146,64 @@ def nv_f16_gemv(weight:Tensor, x:Tensor, in_features:int, out_features:int) -> T
   out = Tensor.empty(out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_f16_gemv_kernel, in_features=in_features, out_features=out_features)
   return Tensor.custom_kernel(out, weight.contiguous(), x.contiguous(), fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
+
+# ******** prefill: integer tensor cores ********
+
+@functools.cache
+def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_features:int, in_features:int, ggml_type:int) -> UOp:
+  group_size = 32 if ggml_type == Q4_K else 16
+  tile, lane = UOp.range((tokens//8)*(out_features//16), 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
+  row_base, token_base = (tile%(out_features//16))*16, (tile//(out_features//16))*8
+  acc = UOp.alloc((4,), dtypes.float32, addrspace=AddrSpace.REG)
+  acc = acc.after(acc.store(acc.const_like(0)))
+  group = UOp.range(in_features//group_size, 1, AxisType.LOOP)
+  block, subgroup = group//(256//group_size), group%(256//group_size)
+
+  def weight_base(row): return (row*(in_features//256)+block)*(36 if ggml_type == Q4_K else 105)
+  def quant(row, k):
+    if ggml_type == Q6_K:
+      y = subgroup*16+k
+      low = raw[weight_base(row)+(y//128)*32+(y%64)//2].load()
+      low = (low >> ((y%2)*8+(y%128//64)*4).cast(dtypes.uint16)) & 15
+      high = raw[weight_base(row)+64+(y//128)*16+(y%32)//2].load()
+      high = (high >> ((y%2)*8+(y%128//32)*2).cast(dtypes.uint16)) & 3
+      return ((low | (high << 4)).cast(dtypes.int32)-32).cast(dtypes.int8)
+    byte = (subgroup//2)*32+k
+    word = raw[weight_base(row)+4+byte//4].load()
+    return ((word >> ((byte%4)*8+(subgroup%2)*4).cast(dtypes.uint32)) & 15).cast(dtypes.int8)
+
+  # m16n8k16/32: A owns two rows and two K halves; B owns one token and two K halves.
+  a = UOp.stack(*(quant(row_base+lane//4+((i//4)%2)*8, (lane%4)*4+i%4+(i//8)*16) for i in range(group_size//2)))
+  token_b = token_base+lane//4
+  b = UOp.stack(*((xq[token_b, group*(group_size//4)+lane%4+(i//4)*4].load() >> ((i%4)*8)).cast(dtypes.uint8).bitcast(dtypes.int8)
+                  for i in range(group_size//4)))
+  dot = UOp.wmma(a, b, UOp.stack(*(UOp.const(0, dtypes.int32) for _ in range(4))), (8,16,group_size), 32)
+  values = []
+  for i in range(4):
+    row, token = row_base+lane//4+(i//2)*8, token_base+(lane%4)*2+i%2
+    base = weight_base(row)
+    if ggml_type == Q6_K:
+      scale = (raw[base+96+subgroup//2].load() >> ((subgroup%2)*8).cast(dtypes.uint16)).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+      value = _half(raw[base+104].load())*scale*dot[i].float()*xd[token, group//2].load()
+      values.append(acc.after(group)[i].load()+value)
+      continue
+    head, s0, s1, s2 = _vload(raw, base, 4)
+    shift = ((subgroup%4)*8).cast(dtypes.uint32)
+    v0, v1, v2 = ((v >> shift) & 255 for v in (s0,s1,s2))
+    scale = (subgroup < 4).where(v0 & 63, (v2 & 15) | ((v0 >> 6) << 4)).float()
+    minimum = (subgroup < 4).where(v1 & 63, (v2 >> 4) | ((v1 >> 6) << 4)).float()
+    value = (_half(head & 65535)*scale*dot[i].float() - _half(head >> 16)*minimum*
+             (xs[token, group*2].load()+xs[token, group*2+1].load()))*xd[token, group].load()
+    values.append(acc.after(group)[i].load()+value)
+  update = acc.store(UOp.stack(*values)).end(group)
+  stores = [out[token_base+(lane%4)*2+i%2, row_base+lane//4+(i//2)*8].store(acc.after(update)[i].load()) for i in range(4)]
+  return UOp.group(*stores).end(tile, lane).sink(arg=KernelInfo(name="q4k_mmq" if ggml_type == Q4_K else "q6k_mmq", opts_to_apply=()))
+
+def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type:int) -> Tensor:
+  shape = x.shape[:-1]
+  tokens = int(x.numel())//in_features
+  padded_tokens = (tokens+7)//8*8
+  x = x.reshape(tokens, in_features).pad(((0, padded_tokens-tokens), (0, 0)))
+  out = Tensor.empty(padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(_mmq_kernel, tokens=padded_tokens, out_features=out_features, in_features=in_features, ggml_type=ggml_type)
+  return Tensor.custom_kernel(out, weight, *q8_quantize(x, padded_tokens, in_features), fxn=fxn)[0][:tokens].reshape(*shape, out_features)
