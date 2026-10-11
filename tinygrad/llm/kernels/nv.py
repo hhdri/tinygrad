@@ -41,22 +41,30 @@ def _vload(buf:UOp, idx:UOp, lanes:int) -> list[UOp]:
 def _half(bits:UOp) -> UOp: return bits.cast(dtypes.uint16).bitcast(dtypes.float16).float()
 def _u32(raw:UOp, idx:UOp) -> UOp: return raw[idx].load().cast(dtypes.uint32) | (raw[idx+1].load().cast(dtypes.uint32) << 16)
 
+def _tile(n:int, *sizes:int) -> int: return next(s for s in sizes if n % s == 0)
+
 # ******** q8 activations ********
 
 @functools.cache
 def _q8_quantize_kernel(xq:UOp, xd:UOp, xs:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
-  groups = in_features//32
-  token_group, lane = UOp.range(tokens*groups, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
-  token, group = token_group//groups, token_group%groups
-  value = x.reshape(tokens, groups, 32)[token, group, lane].load().float()
+  # each lane loads four consecutive values and owns one packed word: a warp covers four groups of 32, the group maximum
+  # reduces over 8 lanes and the per-16 sums over 4. Several warps per block keep the occupancy up.
+  chunks = in_features//128
+  warps = _tile(tokens*chunks, 8, 4, 2, 1)
+  block, lane, warp = UOp.range(tokens*chunks//warps, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP), \
+    UOp.range(warps, 1, AxisType.LOCAL)
+  token_chunk = block*warps + warp
+  token, chunk = token_chunk//chunks, token_chunk%chunks
+  values = [v.float() for v in _vload(x, token*in_features + chunk*128 + lane*4, 4)]
+  amax = functools.reduce(UOp.maximum, (v.abs() for v in values))
   # keep the division: reciprocal multiplication can move values across rounding ties
-  d = _custom("({0}/127.0f)", dtypes.float, warp_reduce(value.abs(), maximum=True)).maximum(1e-30)
-  quant = _custom("rintf({0}/{1})", dtypes.float, value, d).clip(-127, 127)
-  word = quant.cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << ((lane%4)*8).cast(dtypes.uint32)
-  for offset in (1, 2): word = word | _shfl_xor(word, offset)
-  stores = (xq[token, group*8 + (lane//4).valid((lane%4).eq(0))].store(word), xd[token, group.valid(lane.eq(0))].store(d),
-            xs[token, group*2 + (lane//16).valid((lane%16).eq(0))].store(warp_reduce(quant, width=16)))
-  return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
+  d = _custom("({0}/127.0f)", dtypes.float, warp_reduce(amax, maximum=True, width=8)).maximum(1e-30)
+  quants = [_custom("rintf({0}/{1})", dtypes.float, v, d).clip(-127, 127) for v in values]
+  word = functools.reduce(UOp.bitwise_or, (q.cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i,q in enumerate(quants)))
+  group, w = chunk*4 + lane//8, lane%8
+  stores = (xq[token, chunk*32 + lane].store(word), xd[token, group.valid(w.eq(0))].store(d),
+            xs[token, group*2 + (w//4).valid((w%4).eq(0))].store(warp_reduce(sum(quants[1:], quants[0]), width=4)))
+  return UOp.group(*stores).end(block, lane, warp).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
 def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
   xq = Tensor.empty(tokens, in_features//4, dtype=dtypes.uint32, device=x.device)
@@ -153,8 +161,6 @@ def nv_f16_gemv(weight:Tensor, x:Tensor, in_features:int, out_features:int) -> T
   return Tensor.custom_kernel(out, weight.contiguous(), x.contiguous(), fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
 
 # ******** prefill: integer tensor cores ********
-
-def _tile(n:int, *sizes:int) -> int: return next(s for s in sizes if n % s == 0)
 
 @functools.cache
 def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_features:int, in_features:int, ggml_type:int,
