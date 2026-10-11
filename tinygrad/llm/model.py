@@ -239,7 +239,10 @@ class TransformerBlock(FFNBlock):
       sink_col = self.attn_sinks["weight"].reshape(1, -1, 1, 1).expand(1, self.config.n_heads, T, 1)
       if mask is None: mask = Tensor.zeros(1, 1, T, start_pos+T, dtype=x.dtype, buffer=False)
       mask = mask.expand(1, self.config.n_heads, T, start_pos+T).cat(sink_col, dim=-1)
-    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+    # prefill queries in the KV cache dtype: QK^T and PV run as half matmuls on tensor cores (QK^T accumulates in float) instead
+    # of upcasting the cache. Single-token decode is bound by reading the cache and keeps float queries.
+    if resolve(T != 1): q = q.cast(k.dtype)
+    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True).cast(x.dtype)     # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 
