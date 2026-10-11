@@ -169,8 +169,9 @@ class TestNVQuantLinear(unittest.TestCase):
           linear.bias = Tensor(bias)
           for tokens in (1, 3):
             x = rng.normal(size=(1, tokens, k)).astype(dtype)
-            np.testing.assert_allclose(linear(Tensor(x)).numpy(), x.astype(np.float32) @ weight.astype(np.float32).T + bias,
-                                       rtol=2e-4, atol=2e-4)
+            # prefill is an F16 matmul with F32 accumulation; without tensor cores the products round to F16
+            ref_x, tol = (x.astype(np.float16).astype(np.float32), 1e-3*np.sqrt(k)) if tokens > 1 else (x.astype(np.float32), 2e-4)
+            np.testing.assert_allclose(linear(Tensor(x)).numpy(), ref_x @ weight.astype(np.float32).T + bias, rtol=tol, atol=tol)
           np.testing.assert_allclose(linear(Tensor.zeros(1, k)).numpy(), bias[None], atol=1e-6)
 
   def test_dense_extreme_values(self):
