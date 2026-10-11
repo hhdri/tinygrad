@@ -82,6 +82,28 @@ def helper_tc_allclose(N:int, M:int, K:int, dtype_in:DType, dtype_out:DType, axi
   np.testing.assert_allclose(c, ref, atol=tc_atol, rtol=tc_rtol)
 
 class TestTensorCores(unittest.TestCase):
+  @unittest.skipUnless(Device.DEFAULT in ("NV", "CUDA"), "test requires CUDA integer tensor cores")
+  def test_cuda_integer_tensor_cores(self):
+    rng = np.random.default_rng(42)
+    for i, tc in enumerate(Device[Device.DEFAULT].renderer.tensor_cores):
+      if tc.dtype_in not in (dtypes.int8, dtypes.uint8): continue
+      for partial, zero in [(False, False), (True, False), (True, True)]:
+        with self.subTest(tc=tc, partial=partial, zero=zero):
+          n, m, k = (dim*2-int(partial) for dim in tc.dims)
+          dtype = _to_np_dtype(tc.dtype_in)
+          a = rng.integers(tc.dtype_in.min, tc.dtype_in.max+1, (m,k), dtype=dtype)
+          b = rng.integers(tc.dtype_in.min, tc.dtype_in.max+1, (k,n), dtype=dtype)
+          a[:, 0], b[0, :] = tc.dtype_in.min, tc.dtype_in.max
+          if zero: a.fill(0)
+          r = Tensor(a).matmul(Tensor(b), dtype=dtypes.int32)
+          ast, bufs = helper_realized_ast(r)
+          ast = replace_opts(ast, [Opt(OptOps.TC, 0, (i, 2, 1))])
+          program = to_program(ast, Device[Device.DEFAULT].renderer)
+          self.assertTrue(any(u.op is Ops.WMMA for u in program.src[1].src))
+          run_program(ast, bufs)
+          result = np.frombuffer(bufs[0].as_memoryview(), np.int32).reshape(m,n)
+          np.testing.assert_array_equal(result, a.astype(np.int32) @ b.astype(np.int32))
+
   def test_tensor_cores_fp8_signed(self):
     for i, tc in enumerate(Device[Device.DEFAULT].renderer.tensor_cores):
       if tc.dtype_in not in dtypes.fp8s: continue
