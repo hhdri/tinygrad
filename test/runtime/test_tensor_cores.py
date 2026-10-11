@@ -122,6 +122,24 @@ class TestTensorCores(unittest.TestCase):
     out = Tensor.custom_kernel(Tensor.empty(16, 8, dtype=dtypes.int32), Tensor(a.view(np.uint32)), Tensor(b.view(np.uint32)), fxn=kernel)[0]
     np.testing.assert_array_equal(out.numpy(), a.astype(np.int32) @ b.T.astype(np.int32))
 
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_tensor_cores_symbolic_m(self):
+    # a symbolic M (e.g. a prefill chunk) can have a tile-divisible max but not a divisible size: TC pads it to the tile
+    tc = next((tc for tc in Device[Device.DEFAULT].renderer.tensor_cores if tc.dtype_in == dtypes.half and tc.dtype_out == dtypes.float), None)
+    if tc is None: self.skipTest("no half -> float tensor cores")
+    rng = np.random.default_rng(0)
+    a, b = rng.standard_normal((64, 64)).astype(np.float16), rng.standard_normal((64, 32)).astype(np.float16)
+    v, ta, tb = UOp.variable("m", 1, 64), Tensor(a).realize(), Tensor(b).realize()
+    for m in (64, 37, 1):
+      # the default heuristic (TC_OPT=0) pads symbolic axes: check its schedule uses the tensor cores, then run that kernel
+      with self.subTest(m=m), Context(BEAM=0):
+        prod = ta[:v.bind(m)].matmul(tb, dtype=dtypes.float)
+        program = to_program(helper_realized_ast(prod)[0], Device[Device.DEFAULT].renderer)
+        self.assertTrue(any(u.op is Ops.WMMA for u in program.src[1].src))
+        out = ta[:v.bind(m)].matmul(tb, dtype=dtypes.float).realize()
+        result = np.frombuffer(out.uop.base.buffer.as_memoryview(), np.float32).reshape(64, 32)[:m]
+        np.testing.assert_allclose(result, a[:m].astype(np.float32) @ b.astype(np.float32), atol=1e-2, rtol=1e-2)
+
   def test_tensor_cores_fp8_signed(self):
     for i, tc in enumerate(Device[Device.DEFAULT].renderer.tensor_cores):
       if tc.dtype_in not in dtypes.fp8s: continue
