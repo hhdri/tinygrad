@@ -30,10 +30,16 @@ class DiskDevice(Compiled):
       self.mem = mmap.mmap(fd, size, mmap.MAP_SHARED | MAP_POPULATE | MAP_LOCKED)
       os.close(fd)
     else:
+      readonly = False
       try: self.fd = os.open(filename, os.O_RDWR|os.O_CREAT|getattr(os, "O_DIRECT", 0))
-      except OSError: self.fd = os.open(filename, os.O_RDWR|os.O_CREAT)
-      if not pathlib.Path(filename).is_block_device() and os.fstat(self.fd).st_size < size: os.ftruncate(self.fd, size)
-      self.mem = mmap.mmap(self.fd, size)
+      except OSError:
+        try: self.fd = os.open(filename, os.O_RDWR|os.O_CREAT)
+        # a file we can't write (e.g. a model blob owned by another user) is mapped copy-on-write: writes never reach the file
+        except PermissionError: self.fd, readonly = os.open(filename, os.O_RDONLY), True
+      if not pathlib.Path(filename).is_block_device() and os.fstat(self.fd).st_size < size:
+        if readonly: raise PermissionError(f"can't grow read-only {filename} to {size} bytes")
+        os.ftruncate(self.fd, size)
+      self.mem = mmap.mmap(self.fd, size, access=mmap.ACCESS_COPY) if readonly else mmap.mmap(self.fd, size)
       self.info.host.view()[:16] = struct.pack("2Q", self.fd, mv_address(memoryview(self.mem)))
     self.size = size
     if hasattr(self.mem, 'madvise') and (hp := getattr(mmap, "MADV_HUGEPAGE", None)) is not None:
