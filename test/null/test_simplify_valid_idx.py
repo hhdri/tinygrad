@@ -7,6 +7,7 @@ from tinygrad.uop.ops import UOp, Ops, graph_rewrite
 from tinygrad.uop.weak import pm_commit_weak
 from tinygrad.uop.symbolic import simplify_valid, sym, pm_move_where_on_load
 from tinygrad.helpers import Context
+from tinygrad.schedule.prepare import pm_mops
 from test.helpers import full_rewrite
 from test.null.test_uop_symbolic import check_uop_against_string
 
@@ -203,6 +204,19 @@ class TestValidIdxSimplification(unittest.TestCase):
     self.check(load,
       "r0",
       "(r0<((r1*4)+r2))")
+
+  def test_reshape_store_keeps_valid_that_simplifies_index(self):
+    # the first 32 of 64 threads store into a (32, 2) buffer: under the valid the flat index no longer uses the second thread
+    # range, so a load may drop that condition (its value is selected separately), but it still gates the store
+    lane, warp = Range(0, 32), Range(1, 2)
+    tid = warp*32+lane
+    buf = UOp.param(0, dtypes.float, (32, 2))
+    idx = buf[tid.minimum(31).valid(tid < 32), 1]
+    store_idx = graph_rewrite(idx.store(UOp.const(1.0, dtypes.float)), pm_mops, bottom_up=True).src[0]
+    load_idx = graph_rewrite(idx.load(), pm_mops, bottom_up=True).src[0]
+    for flat in (store_idx, load_idx): self.assertNotIn(warp, flat.src[1].get_idx().ranges)
+    self.assertIn(warp, store_idx.src[1].get_valid().ranges)
+    self.assertNotIn(warp, load_idx.src[1].get_valid().ranges)
 
 class TestImageSimplification(unittest.TestCase):
   def check(self, load, svalid, sidx0, sidx1):
