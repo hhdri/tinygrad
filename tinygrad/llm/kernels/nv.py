@@ -20,6 +20,11 @@ def nv_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   with Context(ALLOW_DEVICE_USAGE=1):
     return isinstance(r:=Device[device].renderer, CUDARenderer) and int(r.target.arch[3:]) >= 61
 
+@functools.cache
+def nv_mmq_supported(device:str|tuple[str, ...]|None) -> bool:
+  if not isinstance(device, str) or not nv_custom_kernels_supported(device): return False
+  with Context(ALLOW_DEVICE_USAGE=1): return int(Device[device].renderer.target.arch[3:]) >= 80
+
 def _custom(fmt:str, dtype, *src:UOp) -> UOp: return UOp(Ops.CUSTOM, src=src, arg=(fmt, dtype))
 def _shfl_xor(val:UOp, offset:int) -> UOp: return _custom(f"__shfl_xor_sync(0xffffffffu, {{0}}, {offset})", val.dtype, val)
 def warp_reduce(val:UOp, maximum:bool=False, width:int=32) -> UOp:

@@ -7,7 +7,7 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv, nv_mmq
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv, nv_mmq, nv_mmq_supported
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -129,8 +129,7 @@ class Linear(nn.Linear):
         return super().__call__(x)
     assert self.ggml_type is not None
     numel = x.numel()
-    if prod(x.max_shape) > self.in_features and self.out_features % 16 == 0 and isinstance(self.weight.device, str) \
-      and int(Device[self.weight.device].renderer.target.arch[3:]) >= 80:
+    if prod(x.max_shape) > self.in_features and self.out_features % 16 == 0 and nv_mmq_supported(self.weight.device):
       out = nv_mmq(self.weight, x if isinstance(numel, int) else x.pad_to(x.max_shape),
                    self.in_features, self.out_features, self.ggml_type)
       if not isinstance(numel, int): out = out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))

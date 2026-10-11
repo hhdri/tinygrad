@@ -153,7 +153,7 @@ class TestNVQuantLinear(unittest.TestCase):
           layer.weight = ggml_data_to_tensor(raw,16*1024,typ).reshape(16,1024)
           x = rng.normal(size=(tokens,1024)).astype(np.float32)
           inp = Tensor(np.pad(x,((0,16-tokens),(0,0)))).contiguous()[:UOp.variable("mmq_tokens",1,16).bind(tokens)]
-          actual = layer(inp)[:tokens].numpy()
+          actual = function(lambda x: layer(x), allow_implicit=True)(inp)[:tokens].numpy()
           np.testing.assert_allclose(actual,layer(Tensor(x)).numpy(),atol=2e-4,rtol=2e-4)
 
   def test_dense_decode(self):
