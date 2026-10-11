@@ -157,7 +157,8 @@ def nv_f16_gemv(weight:Tensor, x:Tensor, in_features:int, out_features:int) -> T
 def _tile(n:int, *sizes:int) -> int: return next(s for s in sizes if n % s == 0)
 
 @functools.cache
-def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_features:int, in_features:int, ggml_type:int) -> UOp:
+def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_features:int, in_features:int, ggml_type:int,
+                live:UOp|None=None) -> UOp:
   # Each warp owns row_tiles 16-row x token_tiles 8-token MMA tiles, so every weight fragment feeds token_tiles MMAs and every
   # activation fragment row_tiles MMAs. The block stages 64 weights per row at a time: it unpacks its rows to int8 words in
   # shared memory, decodes each row's group coefficients once, and stages the activations next to them.
@@ -170,11 +171,13 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
   token_tiles = _tile(tokens//8, 4, 2, 1)
   token_warps = _tile(tokens//(8*token_tiles), 4, 2, 1)
   TN, TM, threads = 16*row_tiles*row_warps, 8*token_tiles*token_warps, 32*row_warps*token_warps
-  token_blocks = tokens//TM
-  block, lane = UOp.range(token_blocks*(out_features//TN), 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
+  # a padded symbolic chunk launches only the token blocks holding its live tokens; token blocks vary fastest, so blocks
+  # sharing a weight tile run together and the weights come from L2
+  token_block = UOp.range(tokens//TM if live is None else (live.unbind_all()[0]+TM-1)//TM, 0, AxisType.GLOBAL)
+  row_block, lane = UOp.range(out_features//TN, 1, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
   warp = UOp.range(row_warps*token_warps, 2, AxisType.LOCAL)
   tid, g, t = warp*32+lane, lane//4, lane%4
-  row0, tok0 = (block//token_blocks)*TN, (block%token_blocks)*TM
+  row0, tok0 = row_block*TN, token_block*TM
   wrow, wtok = (warp//token_warps)*(16*row_tiles), (warp%token_warps)*(8*token_tiles)
   # 20-word rows: the fragment reads of 8 rows x 4 words fall in distinct banks, and 16-byte stores stay aligned
   # double buffered: iteration s computes from buffer s%2 while it stages s+1 into the other one; the barrier that ends each
@@ -245,7 +248,7 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
     return stores
 
   prologue = stage_stores(UOp.const(0, dtypes.weakint), 0)
-  stage = UOp.range(stages, 1, AxisType.LOOP)
+  stage = UOp.range(stages, 3, AxisType.LOOP)
   cur = stage%2
   # the last iteration restages its own (clamped) stage into the idle buffer, which nothing reads
   stores = stage_stores((stage+1).minimum(stages-1), 1-cur)
@@ -270,13 +273,17 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
   update = UOp.group(acc.store(UOp.stack(*values)), *stores).end(stage)
   outs = [out[tok0+wtok+j*8+t*2+i%2, row0+wrow+r*16+g+(i//2)*8].store(acc.after(update)[(r*token_tiles+j)*4+i].load())
           for r in range(row_tiles) for j in range(token_tiles) for i in range(4)]
-  return UOp.group(*outs).end(block, lane, warp).sink(arg=KernelInfo(name="q4k_mmq" if q4 else "q6k_mmq", opts_to_apply=()))
+  return UOp.group(*outs).end(token_block, row_block, lane, warp).sink(arg=KernelInfo(name="q4k_mmq" if q4 else "q6k_mmq", opts_to_apply=()))
 
-def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type:int) -> Tensor:
+def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type:int, live:UOp|None=None) -> Tensor:
+  # live: the symbolic token count of a chunk padded to its max size; the rows past it are left unwritten
   shape = x.shape[:-1]
   tokens = int(x.numel())//in_features
   padded_tokens = (tokens+7)//8*8
   x = x.reshape(tokens, in_features).pad(((0, padded_tokens-tokens), (0, 0)))
   out = Tensor.empty(padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
-  fxn = functools.partial(_mmq_kernel, tokens=padded_tokens, out_features=out_features, in_features=in_features, ggml_type=ggml_type)
-  return Tensor.custom_kernel(out, weight, *q8_quantize(x, padded_tokens, in_features), fxn=fxn)[0][:tokens].reshape(*shape, out_features)
+  fxn = functools.partial(_mmq_kernel, tokens=padded_tokens, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
+                          live=live)
+  xq, xd, xs = q8_quantize(x, padded_tokens, in_features)
+  if live is not None: xq = Tensor(xq.uop.after(live))
+  return Tensor.custom_kernel(out, weight, xq, xd, xs, fxn=fxn)[0][:tokens].reshape(*shape, out_features)

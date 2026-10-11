@@ -132,7 +132,7 @@ class Linear(nn.Linear):
     numel = x.numel()
     if prod(x.max_shape) > self.in_features and self.out_features % 16 == 0 and nv_mmq_supported(self.weight.device):
       out = nv_mmq(self.weight, x if isinstance(numel, int) else x.pad_to(x.max_shape),
-                   self.in_features, self.out_features, self.ggml_type)
+                   self.in_features, self.out_features, self.ggml_type, None if isinstance(numel, int) else numel//self.in_features)
       if not isinstance(numel, int): out = out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
       return out if self.bias is None else out + self.bias
     if not isinstance(numel, int) or numel != self.in_features: return x.linear(self.dense.T, self.bias)

@@ -144,7 +144,8 @@ class TestNVQuantLinear(unittest.TestCase):
     if int(Device[Device.DEFAULT].renderer.target.arch[3:]) < 80: self.skipTest("SM80 required")
     rng = np.random.default_rng(11)
     for typ in (12,14):
-      for tokens in (3,8,16):
+      # 256 padded tokens span two 128-token blocks: 3 and 16 live tokens launch only the first, 130 both
+      for tokens in (3,16,130):
         with self.subTest(typ=typ, tokens=tokens):
           packed = rng.integers(0,256,(16*1024//256,QUANT_SIZES[typ]),dtype=np.uint8)
           if typ == 12: packed[:,:4] = np.array([.001,.0002],np.float16).view(np.uint8)
@@ -153,7 +154,7 @@ class TestNVQuantLinear(unittest.TestCase):
           layer = Linear(1024,16,bias=False)
           layer.weight = ggml_data_to_tensor(raw,16*1024,typ).reshape(16,1024)
           x = rng.normal(size=(tokens,1024)).astype(np.float32)
-          inp = Tensor(np.pad(x,((0,16-tokens),(0,0)))).contiguous()[:UOp.variable("mmq_tokens",1,16).bind(tokens)]
+          inp = Tensor(np.pad(x,((0,256-tokens),(0,0)))).contiguous()[:UOp.variable("mmq_tokens",1,256).bind(tokens)]
           actual = function(lambda x: layer(x), allow_implicit=True)(inp)[:tokens].numpy()
           np.testing.assert_allclose(actual,layer(Tensor(x)).numpy(),atol=2e-4,rtol=2e-4)
 
