@@ -139,6 +139,23 @@ class TestNVQuantLinear(unittest.TestCase):
           actual = nv_mmq(raw.bitcast(dtypes.uint32 if typ == 12 else dtypes.uint16),Tensor(x),k,n,typ).numpy()
           np.testing.assert_allclose(actual,reference,atol=2e-4,rtol=2e-4)
 
+  def test_mmq_symbolic_dispatch(self):
+    if int(Device[Device.DEFAULT].renderer.target.arch[3:]) < 80: self.skipTest("SM80 required")
+    rng = np.random.default_rng(11)
+    for typ in (12,14):
+      for tokens in (3,8,16):
+        with self.subTest(typ=typ, tokens=tokens):
+          packed = rng.integers(0,256,(16*1024//256,QUANT_SIZES[typ]),dtype=np.uint8)
+          if typ == 12: packed[:,:4] = np.array([.001,.0002],np.float16).view(np.uint8)
+          else: packed[:,-2:] = np.array([.001],np.float16).view(np.uint8)
+          raw = Tensor(packed.ravel()).realize()
+          layer = Linear(1024,16,bias=False)
+          layer.weight = ggml_data_to_tensor(raw,16*1024,typ).reshape(16,1024)
+          x = rng.normal(size=(tokens,1024)).astype(np.float32)
+          inp = Tensor(np.pad(x,((0,16-tokens),(0,0)))).contiguous()[:UOp.variable("mmq_tokens",1,16).bind(tokens)]
+          actual = layer(inp)[:tokens].numpy()
+          np.testing.assert_allclose(actual,layer(Tensor(x)).numpy(),atol=2e-4,rtol=2e-4)
+
   def test_dense_decode(self):
     rng = np.random.default_rng(3)
     for k, n in ((256, 4), (4096, 64), (4096, 1024), (768, 7), (384, 4)):

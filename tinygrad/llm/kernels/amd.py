@@ -129,9 +129,11 @@ class Linear(nn.Linear):
         return super().__call__(x)
     assert self.ggml_type is not None
     numel = x.numel()
-    if isinstance(numel, int) and numel > self.in_features and self.out_features % 16 == 0 and isinstance(self.weight.device, str) \
+    if prod(x.max_shape) > self.in_features and self.out_features % 16 == 0 and isinstance(self.weight.device, str) \
       and int(Device[self.weight.device].renderer.target.arch[3:]) >= 80:
-      out = nv_mmq(self.weight, x, self.in_features, self.out_features, self.ggml_type)
+      out = nv_mmq(self.weight, x if isinstance(numel, int) else x.pad_to(x.max_shape),
+                   self.in_features, self.out_features, self.ggml_type)
+      if not isinstance(numel, int): out = out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
       return out if self.bias is None else out + self.bias
     if not isinstance(numel, int) or numel != self.in_features: return x.linear(self.dense.T, self.bias)
     out = nv_q8_linear(self.weight, self.ggml_type, x, self.in_features, self.out_features)
