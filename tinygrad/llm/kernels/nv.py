@@ -1,5 +1,5 @@
 from __future__ import annotations
-import functools
+import functools, math
 from tinygrad import Tensor, UOp, Device, Context, dtypes
 from tinygrad.helpers import getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, AddrSpace
@@ -302,3 +302,109 @@ def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type
   xq, xd, xs = q8_quantize(x, padded_tokens, in_features)
   if live is not None: xq = Tensor(xq.uop.after(live))
   return Tensor.custom_kernel(out, weight, xq, xd, xs, fxn=fxn)[0][:tokens].reshape(*shape, out_features)
+
+# ******** prefill: flash attention ********
+
+FA_BLOCK_M, FA_BLOCK_N, FA_WARPS, LOG2E = 64, 64, 4, math.log2(math.e)
+
+@functools.cache
+def _flash_attention_kernel(o:UOp, q:UOp, cache:UOp, valid_kv_len:UOp|int, q_start:UOp|int) -> UOp:
+  # FlashAttention-2 on m16n8k16 half MMAs: each warp owns 16 query rows of a 64-row block and keeps them in registers. Per
+  # 64-key tile the block stages K and V^T in shared memory; the S accumulators are reused as the A fragments of P@V.
+  # q and the cache arrive as uint32 views: two halves per word
+  BH, M, words = q.shape
+  _, B, H_KV, N, _ = cache.shape
+  group, D = BH//(B*H_KV), words*2
+  assert M % FA_BLOCK_M == 0 and D % 16 == 0 and N % FA_BLOCK_N == 0
+  valid_kv_len = valid_kv_len.unbind_all()[0] if isinstance(valid_kv_len, UOp) else valid_kv_len
+  q_start = q_start.unbind_all()[0] if isinstance(q_start, UOp) else q_start
+  # a padded symbolic chunk launches only the query blocks holding its valid_kv_len - q_start live rows
+  live = M if isinstance(valid_kv_len, int) and isinstance(q_start, int) else valid_kv_len - q_start
+  block_bh, block_m = UOp.range(BH, 0, AxisType.GLOBAL), UOp.range((live + FA_BLOCK_M - 1)//FA_BLOCK_M, 1, AxisType.GLOBAL)
+  lane, warp = UOp.range(32, -1, AxisType.WARP), UOp.range(FA_WARPS, 2, AxisType.LOCAL)
+  tid, g, t = warp*32 + lane, lane//4, lane%4
+  kv = block_bh//group  # (batch, kv head)
+  qw, cw = q, cache.reshape(2, B*H_KV, N, words)
+  # padded strides keep the fragment reads (8 rows x 4 words per instruction) in distinct banks
+  K_s = UOp.alloc((FA_BLOCK_N, words + 4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  V_s = UOp.alloc((D, FA_BLOCK_N//2 + 4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  rows = [block_m*FA_BLOCK_M + warp*16 + g + h*8 for h in range(2)]
+  q_frags = [UOp.stack(*(qw[block_bh, rows[i%2], ks*8 + t + (i//2)*4].load() for i in range(4))).bitcast(dtypes.half) for ks in range(D//16)]
+  n_tiles = D//8  # output column tiles of P@V
+  acc = UOp.alloc((n_tiles*4,), dtypes.float32, addrspace=AddrSpace.REG)
+  stats = UOp.alloc((4,), dtypes.float32, addrspace=AddrSpace.REG)  # (row max, partial row sum) for rows g and g+8
+  acc = acc.after(acc.store(acc.const_like(0)))
+  stats = stats.after(stats.store(UOp.stack(*(UOp.const(x, dtypes.float32) for x in (-1e30, -1e30, 0, 0)))))
+  last_key = (q_start + (block_m+1)*FA_BLOCK_M).minimum(valid_kv_len)
+  tile = UOp.range((last_key + FA_BLOCK_N - 1)//FA_BLOCK_N, 3, AxisType.LOOP)
+  threads = 32*FA_WARPS
+  stores = []
+  for i in range(FA_BLOCK_N*words//4//threads):  # K rows: 16-byte chunks straight into shared memory
+    idx = tid + i*threads
+    key, chunk = idx//(words//4), idx%(words//4)
+    kvals = _vload(cw, ((0*B*H_KV + kv)*N + tile*FA_BLOCK_N + key)*words + chunk*4, 4)
+    stores += [K_s[key, chunk*4 + j].store(kvals[j]) for j in range(4)]
+  for i in range(FA_BLOCK_N//2*words//4//threads):  # V^T: two keys' 16-byte chunks become eight (d, key pair) words
+    idx = tid + i*threads
+    pair, chunk = idx//(words//4), idx%(words//4)
+    r0, r1 = (_vload(cw, ((1*B*H_KV + kv)*N + tile*FA_BLOCK_N + pair*2 + e)*words + chunk*4, 4) for e in range(2))
+    for j in range(4):
+      stores.append(V_s[chunk*8 + j*2, pair].store((r0[j] & 0xffff) | (r1[j] << 16)))
+      stores.append(V_s[chunk*8 + j*2 + 1, pair].store((r0[j] >> 16) | (r1[j] & 0xffff0000)))
+  K_r, V_r = K_s.after(*stores), V_s.after(*stores)
+  zero = UOp.stack(*(UOp.const(0.0, dtypes.float32) for _ in range(4)))
+  # S = Q K^T for 8 key tiles of 8
+  s = []
+  for j in range(FA_BLOCK_N//8):
+    c = zero
+    for ks in range(D//16):
+      b = UOp.stack(*(K_r[j*8 + g, ks*8 + t + i*4].load() for i in range(2))).bitcast(dtypes.half)
+      c = UOp.wmma(q_frags[ks], b, c, (8,16,16), 32)
+    s.append(c)
+  scale = LOG2E/math.sqrt(D)
+  old = [stats.after(tile)[i].load() for i in range(4)]
+  new_max:list[UOp] = []
+  probs:list[list[UOp]] = [[] for _ in range(FA_BLOCK_N//8)]
+  for h in range(2):
+    vals = []
+    for j in range(FA_BLOCK_N//8):
+      for e in range(2):
+        key, qpos = tile*FA_BLOCK_N + j*8 + t*2 + e, q_start + rows[h]
+        vals.append(((key <= qpos) & (key < valid_kv_len)).where(s[j][h*2 + e]*scale, UOp.const(-math.inf, dtypes.float32)))
+    m = warp_reduce(functools.reduce(UOp.maximum, vals), maximum=True, width=4).maximum(old[h])
+    new_max.append(m)
+    for j in range(FA_BLOCK_N//8): probs[j] += [(vals[j*2 + e] - m).exp2() for e in range(2)]
+  alpha = [(old[h] - new_max[h]).exp2() for h in range(2)]
+  sums = [old[2+h]*alpha[h] + sum((probs[j][h*2 + e] for j in range(FA_BLOCK_N//8) for e in range(2)), UOp.const(0.0, dtypes.float32))
+          for h in range(2)]
+  # O = O*alpha + P V: two adjacent S tiles (16 keys) are the A fragment of one k step
+  outs = [acc.after(tile)[i].load()*alpha[(i%4)//2] for i in range(n_tiles*4)]
+  for kstep in range(FA_BLOCK_N//16):
+    a = UOp.stack(*(probs[kstep*2 + i//2][(i%2)*2 + e].cast(dtypes.half) for i in range(4) for e in range(2)))
+    for n in range(n_tiles):
+      b = UOp.stack(*(V_r[n*8 + g, kstep*8 + t + i*4].load() for i in range(2))).bitcast(dtypes.half)
+      res = UOp.wmma(a, b, UOp.stack(*outs[n*4:n*4+4]), (8,16,16), 32)
+      outs[n*4:n*4+4] = [res[i] for i in range(4)]
+  update = UOp.group(acc.store(UOp.stack(*outs)), stats.store(UOp.stack(*new_max, *sums))).end(tile)
+  acc, stats = acc.after(update), stats.after(update)
+  totals = [warp_reduce(stats[2+h].load(), width=4) for h in range(2)]
+  ow = o.reshape(BH, M, D)
+  final = [ow[block_bh, rows[i//2], n*8 + t*2 + i%2].store(acc[n*4 + i].load()/totals[i//2]) for n in range(n_tiles) for i in range(4)]
+  return UOp.group(*final).end(block_bh, block_m, lane, warp).sink(arg=KernelInfo(name="nv_flash_attention", opts_to_apply=()))
+
+def nv_flash_attention_supported(q:Tensor, assigned_kv:Tensor) -> bool:
+  return nv_mmq_supported(q.device) and q.shape[3] % 16 == 0 and assigned_kv.shape[3] % FA_BLOCK_N == 0
+
+def nv_flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
+  # causal prefill attention on the half KV cache (already written through assigned_kv); a symbolic chunk is padded to its max
+  # queries are padded to whole 64-row blocks (a symbolic chunk to its max first); the padded rows are sliced off
+  B, H, T, D = q.shape
+  T_pad = (q.max_shape[2] + FA_BLOCK_M - 1)//FA_BLOCK_M*FA_BLOCK_M
+  q_start = valid_end - T
+  qp = q.pad_to((B, H, T_pad, D)) if T_pad != q.max_shape[2] or not isinstance(T, int) else q
+  out = Tensor.empty(B*H, T_pad, D, dtype=dtypes.float32, device=q.device)
+  if isinstance(valid_end, UOp): assigned_kv = Tensor(assigned_kv.uop.after(valid_end))
+  fxn = functools.partial(_flash_attention_kernel, valid_kv_len=valid_end, q_start=q_start)
+  qw = qp.half().reshape(B*H, T_pad, D).contiguous().bitcast(dtypes.uint32)
+  out = Tensor.custom_kernel(out, qw, assigned_kv.bitcast(dtypes.uint32), fxn=fxn)[0].reshape(B, H, T_pad, D)
+  return out if qp is q else out[:, :, :T]
