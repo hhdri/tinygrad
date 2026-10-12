@@ -45,11 +45,6 @@ def pad_unwritten(t:Tensor, shape:tuple[int, ...]) -> Tensor:
   buf = Tensor.empty(*shape, dtype=t.dtype, device=t.device)
   return Tensor(buf.uop.after(buf.uop.shrink(tuple((0, s) for s in t.shape)).store(t.uop)))
 
-def _vload_words(buf:UOp, word:UOp, n:int) -> list[UOp]:
-  # n 32-bit words of a half buffer: one 2n-half vector load, reinterpreted in registers (a uint32 view of the buffer would be a copy
-  # when it is the result of a store, like the KV cache)
-  vec = UOp(Ops.SHRINK, src=(buf.flatten(), word*2, UOp.const(2*n))).load().bitcast(dtypes.uint32)
-  return [vec[i] for i in range(n)]
 def _fma(a:UOp, b:UOp, c:UOp) -> UOp: return _custom("fmaf({0}, {1}, {2})", dtypes.float32, a, b, c)
 def _half(bits:UOp) -> UOp: return bits.cast(dtypes.uint16).bitcast(dtypes.float16).float()
 def _u32(raw:UOp, idx:UOp) -> UOp: return raw[idx].load().cast(dtypes.uint32) | (raw[idx+1].load().cast(dtypes.uint32) << 16)
@@ -348,7 +343,8 @@ def _cp_async(dst:UOp, src:UOp, nbytes:UOp) -> UOp:
   return _custom('asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"((unsigned)__cvta_generic_to_shared({0})), "l"({1}), '
                  '"r"((unsigned)({2})));', dtypes.void, dst, src, nbytes)
 def _cp_wait(*copies:UOp) -> UOp: return _custom('asm volatile("cp.async.wait_all;" ::: "memory");', dtypes.void, *copies)
-def _ldm(buf:UOp, idx:UOp, n:int) -> UOp: return UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(n))).load(arg=f"ldmatrix_x{n}")
+def _ldm(buf:UOp, idx:UOp, n:int, trans:bool=False) -> UOp:
+  return UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(n))).load(arg=f"ldmatrix_x{n}{'_trans' if trans else ''}")
 def _bytes(word:UOp) -> UOp: return UOp.stack(*((word >> (i*8)).cast(dtypes.uint8).bitcast(dtypes.int8) for i in range(4)))
 
 @functools.cache
@@ -607,9 +603,12 @@ def _flash_attention_kernel(o:UOp, q:UOp, cache:UOp, valid_kv_len:UOp|int, q_sta
   tid, g, t = warp*32 + lane, lane//4, lane%4
   kv = block_bh//group  # (batch, kv head)
   cw = cache.reshape(2, B*H_KV, N, D)
-  # padded strides keep the fragment reads (8 rows x 4 words per instruction) in distinct banks
-  K_s = UOp.alloc((FA_BLOCK_N, words + 4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
-  V_s = UOp.alloc((D, FA_BLOCK_N//2 + 4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  # K and V tiles stay row major (key, d): their 16-byte chunks are XOR-swizzled by key, so the ldmatrix rows (8 keys per matrix)
+  # fall in distinct banks; V's fragments are loaded transposed
+  K_s = UOp.alloc((FA_BLOCK_N, words), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  V_s = UOp.alloc((FA_BLOCK_N, words), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  chunks = words//4
+  def swz(key:UOp, chunk:UOp) -> UOp: return key*words + (chunk ^ (key%8))*4
   rows = [block_m*FA_BLOCK_M + warp*16 + g + h*8 for h in range(2)]
   q_frags = [UOp.stack(*(q[block_bh, rows[i%2], (ks*8 + t + (i//2)*4)*2 + e].load() for i in range(4) for e in range(2))) for ks in range(D//16)]
   n_tiles = D//8  # output column tiles of P@V
@@ -620,28 +619,23 @@ def _flash_attention_kernel(o:UOp, q:UOp, cache:UOp, valid_kv_len:UOp|int, q_sta
   last_key = (q_start + (block_m+1)*FA_BLOCK_M).minimum(valid_kv_len)
   tile = UOp.range((last_key + FA_BLOCK_N - 1)//FA_BLOCK_N, 3, AxisType.LOOP)
   threads = 32*FA_WARPS
-  stores = []
-  for i in range(FA_BLOCK_N*words//4//threads):  # K rows: 16-byte chunks straight into shared memory
-    idx = tid + i*threads
-    key, chunk = idx//(words//4), idx%(words//4)
-    kvals = _vload_words(cw, ((0*B*H_KV + kv)*N + tile*FA_BLOCK_N + key)*words + chunk*4, 4)
-    stores += [K_s[key, chunk*4 + j].store(kvals[j]) for j in range(4)]
-  for i in range(FA_BLOCK_N//2*words//4//threads):  # V^T: two keys' 16-byte chunks become eight (d, key pair) words
-    idx = tid + i*threads
-    pair, chunk = idx//(words//4), idx%(words//4)
-    r0, r1 = (_vload_words(cw, ((1*B*H_KV + kv)*N + tile*FA_BLOCK_N + pair*2 + e)*words + chunk*4, 4) for e in range(2))
-    for j in range(4):
-      stores.append(V_s[chunk*8 + j*2, pair].store((r0[j] & 0xffff) | (r1[j] << 16)))
-      stores.append(V_s[chunk*8 + j*2 + 1, pair].store((r0[j] >> 16) | (r1[j] & 0xffff0000)))
-  K_r, V_r = K_s.after(*stores), V_s.after(*stores)
+  copies = []
+  for sel, buf in enumerate((K_s, V_s)):  # the tile's K and V rows: 16-byte chunks from the cache through cp.async (no registers)
+    for i in range(FA_BLOCK_N*chunks//threads):
+      idx = tid + i*threads
+      key, chunk = idx//chunks, idx%chunks
+      copies.append(_cp_async(buf.flatten()[swz(key, chunk)], cw.flatten()[((sel*B*H_KV + kv)*N + tile*FA_BLOCK_N + key)*D + chunk*8],
+                              UOp.const(16, dtypes.int)))
+  ready = _cp_wait(*copies).barrier()
+  K_r, V_r = K_s.after(ready), V_s.after(ready)
   zero = UOp.stack(*(UOp.const(0.0, dtypes.float32) for _ in range(4)))
   # S = Q K^T for 8 key tiles of 8
   s = []
   for j in range(FA_BLOCK_N//8):
     c = zero
-    for ks in range(D//16):
-      b = UOp.stack(*(K_r[j*8 + g, ks*8 + t + i*4].load() for i in range(2))).bitcast(dtypes.half)
-      c = UOp.wmma(q_frags[ks], b, c, (8,16,16), 32)
+    for kp in range(D//32):  # one ldmatrix.x4 holds the B fragments of two k steps: matrices (keys j*8.., d 32kp + 8m..)
+      fr = _ldm(K_r, swz(j*8 + lane%8, kp*4 + lane//8), 4)
+      for e in range(2): c = UOp.wmma(q_frags[kp*2 + e], UOp.stack(fr[e*2], fr[e*2+1]).bitcast(dtypes.half), c, (8,16,16), 32)
     s.append(c)
   scale = LOG2E/math.sqrt(D)
   old = [stats.after(tile)[i].load() for i in range(4)]
@@ -663,11 +657,14 @@ def _flash_attention_kernel(o:UOp, q:UOp, cache:UOp, valid_kv_len:UOp|int, q_sta
   outs = [acc.after(tile)[i].load()*alpha[(i%4)//2] for i in range(n_tiles*4)]
   for kstep in range(FA_BLOCK_N//16):
     a = UOp.stack(*(probs[kstep*2 + i//2][(i%2)*2 + e].cast(dtypes.half) for i in range(4) for e in range(2)))
-    for n in range(n_tiles):
-      b = UOp.stack(*(V_r[n*8 + g, kstep*8 + t + i*4].load() for i in range(2))).bitcast(dtypes.half)
-      res = UOp.wmma(a, b, UOp.stack(*outs[n*4:n*4+4]), (8,16,16), 32)
-      outs[n*4:n*4+4] = [res[i] for i in range(4)]
-  update = UOp.group(acc.store(UOp.stack(*outs)), stats.store(UOp.stack(*new_max, *sums))).end(tile)
+    for np_ in range(n_tiles//2):  # one ldmatrix.x4.trans holds the B fragments of two d tiles: matrices (keys +0/+8, d tile 2np/2np+1)
+      fr = _ldm(V_r, swz(kstep*16 + lane%8 + (lane//8%2)*8, np_*2 + lane//16), 4, trans=True)
+      for e in range(2):
+        n = np_*2 + e
+        res = UOp.wmma(a, UOp.stack(fr[e*2], fr[e*2+1]).bitcast(dtypes.half), UOp.stack(*outs[n*4:n*4+4]), (8,16,16), 32)
+        outs[n*4:n*4+4] = [res[i] for i in range(4)]
+  # the barrier ends the tile, so the next tile's copies don't overwrite K and V while a warp still reads them
+  update = UOp.group(acc.store(UOp.stack(*outs)), stats.store(UOp.stack(*new_max, *sums))).barrier().end(tile)
   acc, stats = acc.after(update), stats.after(update)
   totals = [warp_reduce(stats[2+h].load(), width=4) for h in range(2)]
   ow = o.reshape(BH, M, D)
