@@ -48,12 +48,14 @@ def _tile(n:int, *sizes:int) -> int: return next(s for s in sizes if n % s == 0)
 # ******** q8 activations ********
 
 @functools.cache
-def _q8_quantize_kernel(xq:UOp, xd:UOp, xs:UOp, x:UOp, *up:UOp, tokens:int, in_features:int) -> UOp:
+def _q8_quantize_kernel(xq:UOp, xd:UOp, xs:UOp, x:UOp, *up:UOp, tokens:int, in_features:int, live:UOp|None=None) -> UOp:
   # each lane loads four consecutive values and owns one packed word: a warp covers four groups of 32, the group maximum
   # reduces over 8 lanes and the per-16 sums over 4. Several warps per block keep the occupancy up.
   chunks = in_features//128
   warps = _tile(tokens*chunks, 8, 4, 2, 1)
-  block, lane, warp = UOp.range(tokens*chunks//warps, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP), \
+  # a padded symbolic chunk quantizes only its live tokens (rounded up to whole blocks); the rows past them stay unwritten
+  blocks = tokens*chunks//warps if live is None else (live.unbind_all()[0]*chunks+warps-1)//warps
+  block, lane, warp = UOp.range(blocks, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP), \
     UOp.range(warps, 1, AxisType.LOCAL)
   token_chunk = block*warps + warp
   token, chunk = token_chunk//chunks, token_chunk%chunks
@@ -70,14 +72,16 @@ def _q8_quantize_kernel(xq:UOp, xd:UOp, xs:UOp, x:UOp, *up:UOp, tokens:int, in_f
             xs[token, group*2 + (w//4).valid((w%4).eq(0))].store(warp_reduce(sum(quants[1:], quants[0]), width=4)))
   return UOp.group(*stores).end(block, lane, warp).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
-def q8_quantize(x:Tensor, tokens:int, in_features:int, cache:dict|None=None, up:Tensor|None=None) -> tuple[Tensor, Tensor, Tensor]:
+def q8_quantize(x:Tensor, tokens:int, in_features:int, cache:dict|None=None, up:Tensor|None=None,
+                live:UOp|None=None) -> tuple[Tensor, Tensor, Tensor]:
   # cache: shared by projections of the same input (Linear.project), which then quantize it once
   # up: x is a SwiGLU gate, the quantized input is silu(x)*up (never written out)
   if cache is not None and up is None and (hit:=cache.get((tokens, in_features))) is not None: return hit
   xq = Tensor.empty(tokens, in_features//4, dtype=dtypes.uint32, device=x.device)
   xd = Tensor.empty(tokens, in_features//32, dtype=dtypes.float32, device=x.device)
   xs = Tensor.empty(tokens, in_features//16, dtype=dtypes.float32, device=x.device)
-  fxn = functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features)
+  fxn = functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features, live=live)
+  if live is not None: xq = Tensor(xq.uop.after(live))  # carries the live-token binding into the kernel
   xq, xd, xs = Tensor.custom_kernel(xq, xd, xs, x.contiguous(), *(() if up is None else (up.contiguous(),)), fxn=fxn)[:3]
   if cache is not None and up is None: cache[(tokens, in_features)] = (xq, xd, xs)
   return xq, xd, xs
@@ -327,7 +331,7 @@ def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type
   out = Tensor.empty(padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_mmq_kernel, tokens=padded_tokens, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
                           live=live)
-  xq, xd, xs = q8_quantize(x, padded_tokens, in_features, q8, up)
+  xq, xd, xs = q8_quantize(x, padded_tokens, in_features, q8, up, live)
   if live is not None: xq = Tensor(xq.uop.after(live))
   return Tensor.custom_kernel(out, weight, xq, xd, xs, fxn=fxn)[0][:tokens].reshape(*shape, out_features)
 
