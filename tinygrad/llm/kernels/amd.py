@@ -7,7 +7,8 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv, nv_mmq, nv_mmq_supported
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv, nv_mmq, nv_mmq_supported, \
+  pad_unwritten
 from tinygrad.llm.kernels.nv import warp_reduce as nv_warp_reduce
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
@@ -55,9 +56,10 @@ def _reg(shape:tuple[int, ...], value:float, dep:UOp|None=None) -> UOp:
 
 def _pad_to_max(t:Tensor) -> Tensor:
   # a symbolic slice of a max-size buffer (a custom kernel's padded output) passes on the whole buffer: the padded rows only feed
-  # outputs past the live tokens, which the kernels skip. Padding the slice instead would copy it.
+  # outputs past the live tokens, which the kernels skip. Padding the slice instead would copy it; anything else is written into an
+  # uninitialized max-size buffer, live rows only
   if (u:=t.uop).op is Ops.SHRINK and u.src[0].shape == t.max_shape and u.src[0].base.has_buffer_identity(after_ok=True): return Tensor(u.src[0])
-  return t.pad_to(t.max_shape)
+  return pad_unwritten(t, t.max_shape)
 
 def silu_gate(gate:Tensor) -> Tensor:
   # TODO: remove the need for this contiguous. A lazy gate matmul needs its own kernel (fused into the up/down product it is much

@@ -39,6 +39,12 @@ def _dp4a(a:UOp, b:UOp, c:UOp) -> UOp: return _custom("__dp4a({0}, {1}, {2})", d
 def _vload(buf:UOp, idx:UOp, lanes:int) -> list[UOp]:
   vec = UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(lanes))).load()
   return [vec[i] for i in range(lanes)]
+def pad_unwritten(t:Tensor, shape:tuple[int, ...]) -> Tensor:
+  # t (of symbolic size) as the leading slice of an uninitialized buffer of shape: the producing kernel runs over t only, where pad_to
+  # would also write the zeros, for consumers that skip the rows past the live ones
+  buf = Tensor.empty(*shape, dtype=t.dtype, device=t.device)
+  return Tensor(buf.uop.after(buf.uop.shrink(tuple((0, s) for s in t.shape)).store(t.uop)))
+
 def _vload_words(buf:UOp, word:UOp, n:int) -> list[UOp]:
   # n 32-bit words of a half buffer: one 2n-half vector load, reinterpreted in registers (a uint32 view of the buffer would be a copy
   # when it is the result of a store, like the KV cache)
@@ -677,10 +683,11 @@ def nv_flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tenso
   B, H, T, D = q.shape
   T_pad = (q.max_shape[2] + FA_BLOCK_M - 1)//FA_BLOCK_M*FA_BLOCK_M
   q_start = valid_end - T
-  qp = q.pad_to((B, H, T_pad, D)) if T_pad != q.max_shape[2] or not isinstance(T, int) else q
+  padded = T_pad != q.max_shape[2] or not isinstance(T, int)
   out = Tensor.empty(B*H, T_pad, D, dtype=dtypes.float32, device=q.device)
   if isinstance(valid_end, UOp): assigned_kv = Tensor(assigned_kv.uop.after(valid_end))
   fxn = functools.partial(_flash_attention_kernel, valid_kv_len=valid_end, q_start=q_start)
-  qh = qp.half().reshape(B*H, T_pad, D).contiguous()
+  qh = q.half().reshape(B*H, T, D)
+  qh = pad_unwritten(qh, (q.max_shape[0]*q.max_shape[1], T_pad, q.max_shape[3])) if padded else qh.contiguous()
   out = Tensor.custom_kernel(out, qh, assigned_kv, fxn=fxn)[0].reshape(B, H, T_pad, D)
-  return out if qp is q else out[:, :, :T]
+  return out[:, :, :T] if padded else out

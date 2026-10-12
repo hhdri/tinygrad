@@ -158,6 +158,9 @@ class TestNVQuantLinear(unittest.TestCase):
           inp = Tensor(np.pad(x,((0,384-tokens),(0,0)))).contiguous()[:UOp.variable("mmq_tokens",1,384).bind(tokens)]
           actual = function(lambda x: layer(x), allow_implicit=True)(inp)[:tokens].numpy()
           np.testing.assert_allclose(actual,layer(Tensor(x)).numpy(),atol=2e-4,rtol=2e-4)
+          # a lazy input is written into an uninitialized max-size buffer (live rows only) instead of passed on as a buffer slice
+          actual = function(lambda x: layer(x*2), allow_implicit=True)(inp)[:tokens].numpy()
+          np.testing.assert_allclose(actual,layer(Tensor(x*2)).numpy(),atol=4e-4,rtol=2e-4)
 
   def test_swiglu(self):
     # silu(gate)*up quantized inside the q8 kernel vs the product as an ordinary input: decode, static and symbolic prefill (gate and up
