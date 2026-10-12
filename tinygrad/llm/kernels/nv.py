@@ -1,7 +1,7 @@
 from __future__ import annotations
 import functools, math
 from tinygrad import Tensor, UOp, Device, Context, dtypes
-from tinygrad.helpers import getenv
+from tinygrad.helpers import getenv, prod
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, AddrSpace
 from tinygrad.renderer.cstyle import CUDARenderer
 
@@ -590,17 +590,19 @@ def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type
 # ******** decode: residual sum, RMS norm and q8 quantization in one kernel ********
 
 @functools.cache
-def _rmsnorm_q8_kernel(xq:UOp, xd:UOp, xs:UOp, *rest:UOp, n_parts:int, dim:int, eps:float, write_sum:bool, write_normed:bool) -> UOp:
-  # one decode token: x = sum of the parts (the residual stream), its RMS norm with the weight, then the q8 quantization of
-  # q8_quantize (group-major scales and sums). One block of up to 32 warps, warp w owns 128-value chunks w, w+32, ...; the sum of
-  # squares reduces over each warp and then across the warps through shared memory.
+def _rmsnorm_q8_kernel(xq:UOp, xd:UOp, xs:UOp, *rest:UOp, n_parts:int, dim:int, eps:float, write_sum:bool, write_normed:bool, tokens:int=1,
+                       live:UOp|None=None) -> UOp:
+  # per token: x = sum of the parts (the residual stream), its RMS norm with the weight, then the q8 quantization of q8_quantize
+  # (group-major scales and sums). One block of up to 32 warps per token (a padded chunk launches its live tokens only), warp w owns
+  # 128-value chunks w, w+32, ...; the sum of squares reduces over each warp and then across the warps through shared memory.
   outs = list(rest[:int(write_sum)+int(write_normed)])
   parts, weight = rest[len(outs):len(outs)+n_parts], rest[-1]
   chunks = dim//128
-  warps = min(chunks, 32)  # one warp per chunk: the kernel is latency bound (one token)
+  warps = min(chunks, 32)  # one warp per chunk: one token's work is latency bound
+  token = UOp.range(tokens if live is None else live.unbind_all()[0], 0, AxisType.GLOBAL)
   lane, warp = UOp.range(32, -1, AxisType.WARP), UOp.range(warps, 1, AxisType.LOCAL)
   idx = [(warp + warps*c)*128 + lane*4 + i for c in range(chunks//warps) for i in range(4)]
-  vals = [functools.reduce(UOp.__add__, (p[j].load() for p in parts)) for j in idx]
+  vals = [functools.reduce(UOp.__add__, (p[token*dim + j].load() for p in parts)) for j in idx]
   red = UOp.alloc((warps,), dtypes.float32, addrspace=AddrSpace.LOCAL)
   red = red.after(red[warp.valid(lane.eq(0))].store(warp_reduce(sum((v*v for v in vals[1:]), vals[0]*vals[0]))).barrier())
   rms = (sum((red[w].load() for w in range(1, warps)), red[0].load())/dim + eps).rsqrt()
@@ -609,36 +611,54 @@ def _rmsnorm_q8_kernel(xq:UOp, xd:UOp, xs:UOp, *rest:UOp, n_parts:int, dim:int, 
     chunk = warp + warps*c
     v = vals[c*4:c*4+4]
     normed = [x*rms*weight[j].load().float() for x, j in zip(v, idx[c*4:c*4+4])]
-    if write_sum: stores += [outs[0][j].store(x) for x, j in zip(v, idx[c*4:c*4+4])]
-    if write_normed: stores += [outs[-1][j].store(x) for x, j in zip(normed, idx[c*4:c*4+4])]
+    if write_sum: stores += [outs[0][token*dim + j].store(x) for x, j in zip(v, idx[c*4:c*4+4])]
+    if write_normed: stores += [outs[-1][token*dim + j].store(x) for x, j in zip(normed, idx[c*4:c*4+4])]
     amax = functools.reduce(UOp.maximum, (x.abs() for x in normed))
     d = _custom("({0}/127.0f)", dtypes.float, warp_reduce(amax, maximum=True, width=8)).maximum(1e-30)
     quants = [_custom("rintf({0}/{1})", dtypes.float, x, d).clip(-127, 127) for x in normed]
     word = functools.reduce(UOp.bitwise_or, (q.cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i,q in enumerate(quants)))
     group, w = chunk*4 + lane//8, lane%8
-    stores += [xq[0, chunk*32 + lane].store(word), xd[group.valid(w.eq(0)), 0].store(d),
-               xs[group*2 + (w//4).valid((w%4).eq(0)), 0].store(warp_reduce(sum(quants[1:], quants[0]), width=4))]
-  return UOp.group(*stores).end(lane, warp).sink(arg=KernelInfo(name="rmsnorm_q8", opts_to_apply=()))
+    stores += [xq[token, chunk*32 + lane].store(word), xd[group.valid(w.eq(0)), token].store(d),
+               xs[group*2 + (w//4).valid((w%4).eq(0)), token].store(warp_reduce(sum(quants[1:], quants[0]), width=4))]
+  return UOp.group(*stores).end(token, lane, warp).sink(arg=KernelInfo(name="rmsnorm_q8", opts_to_apply=()))
 
 def nv_rmsnorm_q8_supported(x:Tensor, dim:int) -> bool:
-  return nv_custom_kernels_supported(x.device) and isinstance(x.device, str) and dim % 1024 == 0 and isinstance(n:=x.numel(), int) and n == dim
+  # one decode token, or a symbolic prefill chunk (the MMQ path)
+  if not (nv_custom_kernels_supported(x.device) and isinstance(x.device, str) and dim % 1024 == 0): return False
+  return x.numel() == dim if isinstance(x.numel(), int) else nv_mmq_supported(x.device) and prod(x.max_shape) % (8*dim) == 0
 
 def nv_rmsnorm_q8(parts:list[Tensor], weight:Tensor, eps:float, write_sum:bool=False, write_normed:bool=False) -> tuple[Tensor|None,
                   Tensor|None, dict]:
-  # one decode token: returns the sum of the parts (if write_sum), the normed input (if write_normed) and a q8 cache for
-  # Linear.project, whose packed projections then skip their own quantization
-  dim, dev = int(parts[0].numel()), parts[0].device
-  xq = Tensor.empty(1, dim//4, dtype=dtypes.uint32, device=dev)
-  xd, xs = Tensor.empty(dim//32, 1, dtype=dtypes.float32, device=dev), Tensor.empty(dim//16, 1, dtype=dtypes.float32, device=dev)
-  extra = [Tensor.empty(dim, dtype=dtypes.float32, device=dev) for _ in range(int(write_sum)+int(write_normed))]
-  fxn = functools.partial(_rmsnorm_q8_kernel, n_parts=len(parts), dim=dim, eps=eps, write_sum=write_sum, write_normed=write_normed)
+  # one decode token or a symbolic prefill chunk: returns the sum of the parts (if write_sum), the normed input (if write_normed) and
+  # a q8 cache for Linear.project, whose packed projections then skip their own quantization
+  shape, dim, dev = parts[0].shape, int(parts[0].shape[-1]), parts[0].device
+  numel = parts[0].numel()
+  live = None if isinstance(numel, int) else numel//dim
+  tokens = prod(parts[0].max_shape)//dim
+  xq = Tensor.empty(tokens, dim//4, dtype=dtypes.uint32, device=dev)
+  xd = Tensor.empty(dim//32, tokens, dtype=dtypes.float32, device=dev)
+  xs = Tensor.empty(dim//16, tokens, dtype=dtypes.float32, device=dev)
+  if live is not None: xq = Tensor(xq.uop.after(live))  # carries the live-token binding into the kernel
+  extra = [Tensor.empty(tokens*dim, dtype=dtypes.float32, device=dev) for _ in range(int(write_sum)+int(write_normed))]
+  fxn = functools.partial(_rmsnorm_q8_kernel, n_parts=len(parts), dim=dim, eps=eps, write_sum=write_sum, write_normed=write_normed,
+                          tokens=tokens, live=live)
+  ins = [(p if live is None else pad_to_max(p)).reshape(tokens*dim).float().contiguous() for p in parts]
   # the weight goes in as stored (a float cast here would be a kernel per call), the kernel converts it
-  outs = Tensor.custom_kernel(xq, xd, xs, *extra, *(p.reshape(dim).float().contiguous() for p in parts), weight.contiguous(), fxn=fxn)
+  outs = Tensor.custom_kernel(xq, xd, xs, *extra, *ins, weight.contiguous(), fxn=fxn)
   xq, xd, xs, extra = outs[0], outs[1], outs[2], outs[3:3+len(extra)]
-  shape = parts[0].shape
-  h = extra[0].reshape(shape) if write_sum else None
-  xn = extra[-1].reshape(shape) if write_normed else None
-  return h, xn, {(1, dim, True): (xq, xd, xs)}
+  def view(t:Tensor) -> Tensor:
+    t = t.reshape(*parts[0].max_shape)
+    return t if live is None else t.shrink(tuple((0, s) for s in shape))
+  h = view(extra[0]) if write_sum else None
+  xn = view(extra[-1]) if write_normed else None
+  return h, xn, {(tokens, dim, True): (xq, xd, xs)}
+
+def pad_to_max(t:Tensor) -> Tensor:
+  # a symbolic slice of a max-size buffer (a custom kernel's padded output) passes on the whole buffer: the padded rows only feed
+  # outputs past the live tokens, which the kernels skip. Padding the slice instead would copy it; anything else is written into an
+  # uninitialized max-size buffer, live rows only
+  if (u:=t.uop).op is Ops.SHRINK and u.src[0].shape == t.max_shape and u.src[0].base.has_buffer_identity(after_ok=True): return Tensor(u.src[0])
+  return pad_unwritten(t, t.max_shape)
 
 # ******** decode: flash-decoding combine with the o-proj input's q8 quantization ********
 

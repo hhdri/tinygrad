@@ -205,6 +205,20 @@ class TestNVQuantLinear(unittest.TestCase):
         np.testing.assert_allclose(q*d, ref, atol=float(d.max())*0.51)
         sums = q.reshape(-1, 16).sum(-1)
         np.testing.assert_allclose(xs.numpy().reshape(-1), sums)
+    # a symbolic prefill chunk: live tokens of a 64-token padded buffer, one block per live token
+    T, live = 64, 21
+    xp, ap = (rng.normal(size=(1, T, D)).astype(np.float32)*3 for _ in range(2))
+    tv = UOp.variable("norm_tokens", 1, T).bind(live)
+    xi, ai = (Tensor(a).contiguous()[:, :tv] for a in (xp, ap))
+    h, _, q8 = nv_rmsnorm_q8([xi, ai], w, eps, write_sum=True)
+    xq, xd, xs = q8[(T, D, True)]
+    Tensor.realize(h, xq, xd, xs)
+    s_ = (xp + ap)[0, :live]
+    ref = s_ * (1/np.sqrt((s_.astype(np.float64)**2).mean(-1, keepdims=True) + eps)) * w.numpy()
+    np.testing.assert_allclose(h[:, :live].numpy()[0], s_, atol=1e-6, rtol=1e-6)
+    q = xq.numpy()[:live].view(np.int8).astype(np.float32)
+    d = np.repeat(xd.numpy()[:, :live].T, 32, axis=1)
+    np.testing.assert_allclose(q*d, ref, atol=float(d.max())*0.51)
 
   def test_flash_decode_q8(self):
     # the flash-decoding combine with q8 output vs the shared combine's float output (dequantized within a step)
