@@ -112,10 +112,12 @@ class TransformerConfig:
   sliding_window: int = 0
   sliding_window_pattern: int = 0
 
-def _silu_gate(gate:Tensor) -> Tensor:
-  # TODO: remove the need for this contiguous. A lazy gate matmul needs its own kernel (fused into the up/down product it is much
-  # slower); a gate that is already a buffer (custom kernel output) is cheaper fused into its consumer
-  return gate.silu() if gate.uop.base.has_buffer_identity(after_ok=True) else gate.silu().contiguous()
+def _own_kernel(x:Tensor) -> Tensor:
+  # TODO: remove the need for this contiguous. A lazy matmul fused into a consumer that doesn't need all of it (the SwiGLU product,
+  # the stacked KV cache store) is much slower; a tensor that is already a buffer (custom kernel output) is cheaper fused
+  return x if x.uop.base.has_buffer_identity(after_ok=True) else x.contiguous()
+
+def _silu_gate(gate:Tensor) -> Tensor: return gate.silu() if gate.uop.base.has_buffer_identity(after_ok=True) else gate.silu().contiguous()
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -203,7 +205,8 @@ class TransformerBlock(FFNBlock):
     if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+    # v gets its own kernel: fused into the stacked KV cache store, the k half of the store would also run the v matmul
+    q, k, v = self.attn_q(x), self.attn_k(x), _own_kernel(self.attn_v(x))
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
