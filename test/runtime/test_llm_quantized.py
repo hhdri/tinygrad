@@ -158,6 +158,33 @@ class TestNVQuantLinear(unittest.TestCase):
           actual = function(lambda x: layer(x), allow_implicit=True)(inp)[:tokens].numpy()
           np.testing.assert_allclose(actual,layer(Tensor(x)).numpy(),atol=2e-4,rtol=2e-4)
 
+  def test_swiglu(self):
+    # silu(gate)*up quantized inside the q8 kernel vs the product as an ordinary input: decode, static and symbolic prefill (gate and up
+    # are slices of padded buffers, passed on whole), and a dense layer that falls back to the product
+    rng = np.random.default_rng(5)
+    mmq = int(Device[Device.DEFAULT].renderer.target.arch[3:]) >= 80
+    for typ in (12, 14):
+      packed = rng.integers(0, 256, (32*1024//256, QUANT_SIZES[typ]), dtype=np.uint8)
+      if typ == 12: packed[:, :4] = np.array([.001, .0002], np.float16).view(np.uint8)
+      else: packed[:, -2:] = np.array([.001], np.float16).view(np.uint8)
+      layer = Linear(1024, 32, bias=False)
+      layer.weight = ggml_data_to_tensor(Tensor(packed.ravel()).realize(), 32*1024, typ).reshape(32, 1024)
+      for tokens, symbolic in ((1, False), (40, False), (3, True), (130, True)):
+        if tokens > 1 and not mmq: continue
+        with self.subTest(typ=typ, tokens=tokens, symbolic=symbolic):
+          g, u = (rng.normal(size=(1, tokens, 1024)).astype(np.float32)*3 for _ in range(2))
+          expected = layer(Tensor(g).silu()*Tensor(u)).numpy()
+          if symbolic:
+            v = UOp.variable("swiglu_tokens", 1, 256).bind(tokens)
+            gi, ui = (Tensor(np.pad(a, ((0, 0), (0, 256-tokens), (0, 0)))).contiguous()[:, :v] for a in (g, u))
+            actual = function(lambda g, u: layer.swiglu(g, u), allow_implicit=True)(gi, ui)[:, :tokens].numpy()
+          else: actual = layer.swiglu(Tensor(g), Tensor(u)).numpy()
+          np.testing.assert_allclose(actual, expected, atol=2e-4, rtol=2e-4)
+    dense = Linear(256, 4, bias=False)
+    dense.weight = Tensor(rng.normal(size=(4, 256)).astype(np.float16))
+    g, u = (Tensor(rng.normal(size=(1, 1, 256)).astype(np.float32)) for _ in range(2))
+    np.testing.assert_allclose(dense.swiglu(g, u).numpy(), dense(g.silu()*u).numpy(), atol=1e-5, rtol=1e-5)
+
   def test_dense_decode(self):
     rng = np.random.default_rng(3)
     for k, n in ((256, 4), (4096, 64), (4096, 1024), (768, 7), (384, 4)):
