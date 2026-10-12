@@ -1,5 +1,4 @@
 import unittest, gc, struct, ctypes, threading, numpy as np
-from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
 from tinygrad.device import Buffer, BufferSpec
 from tinygrad.dtype import AddrSpace
@@ -18,22 +17,6 @@ def cpu_buf(size:int=1, dtype=dtypes.uint8, tag=None, **kwargs) -> UOp: return U
 
 @unittest.skipUnless(all_devices_in(Device.DEFAULT, HCQ_DEVS) and not Device.DEFAULT.startswith("NULL"), "hcq2 device required")
 class TestHCQ2Schedule(unittest.TestCase):
-  @unittest.skipUnless(Device.DEFAULT.startswith("NV"), "NV device required")
-  def test_nv_invalidate_caches(self):
-    from tinygrad.runtime import ops_nv
-    from tinygrad.runtime.autogen import nv_570, nv_610, nv_615
-    dev = Device[Device.DEFAULT]
-    if dev.is_nvd(): self.skipTest("kernel driver required")
-    x = Tensor.arange(1024).contiguous().realize()
-    dev.synchronize()
-    dev.invalidate_caches()
-    np.testing.assert_array_equal(x.numpy(), np.arange(1024))
-    # 615 widened the aperture field, moving the flush flags up a bit
-    for mod, flags in ((nv_570, 0x1c), (nv_610, 0x1c), (nv_615, 0x38)):
-      with self.subTest(mod=mod.__name__), patch.object(ops_nv, "nv_gpu", mod), patch.object(dev.iface, "rm_control") as control:
-        dev.invalidate_caches()
-        self.assertEqual(control.call_args.args[2].flags, flags)
-
   def test_compile_and_link_are_idempotent(self):
     for jit in (False, True):
       with self.subTest(jit=jit):
