@@ -90,8 +90,14 @@ class Linear(nn.Linear):
     self.ggml_type = ggml_type
     self.shard_axis = decoded.uop.axis
     self.weight = Tensor(raw).flatten().bitcast(word_dtype).contiguous()
-  def __call__(self, x:Tensor) -> Tensor:
-    if self.use_custom_quant and nv_custom_kernels_supported(self.weight.device): return self._nv_call(x)
+  @staticmethod
+  def project(x:Tensor, *layers:nn.Linear) -> list[Tensor]:
+    # projections of one input: on NVIDIA its q8 quantization is shared, so it runs once
+    q8:dict = {}
+    return [l(x, q8) if isinstance(l, Linear) else l(x) for l in layers]
+
+  def __call__(self, x:Tensor, q8:dict|None=None) -> Tensor:
+    if self.use_custom_quant and nv_custom_kernels_supported(self.weight.device): return self._nv_call(x, q8)
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
@@ -112,7 +118,7 @@ class Linear(nn.Linear):
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return super().__call__(x)
 
-  def _nv_call(self, x:Tensor) -> Tensor:
+  def _nv_call(self, x:Tensor, q8:dict|None=None) -> Tensor:
     if self.ggml_type is None:
       # keep the lazy dequantization for the shapes the packed kernels don't cover
       self.dense = self.weight
@@ -134,11 +140,11 @@ class Linear(nn.Linear):
     numel = x.numel()
     if prod(x.max_shape) > self.in_features and self.out_features % 16 == 0 and nv_mmq_supported(self.weight.device):
       out = nv_mmq(self.weight, x if isinstance(numel, int) else x.pad_to(x.max_shape),
-                   self.in_features, self.out_features, self.ggml_type, None if isinstance(numel, int) else numel//self.in_features)
+                   self.in_features, self.out_features, self.ggml_type, None if isinstance(numel, int) else numel//self.in_features, q8)
       if not isinstance(numel, int): out = out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
       return out if self.bias is None else out + self.bias
     if not isinstance(numel, int) or numel != self.in_features: return x.linear(self.dense.T, self.bias)
-    out = nv_q8_linear(self.weight, self.ggml_type, x, self.in_features, self.out_features)
+    out = nv_q8_linear(self.weight, self.ggml_type, x, self.in_features, self.out_features, q8)
     return out if self.bias is None else out + self.bias
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:

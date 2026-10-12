@@ -173,7 +173,8 @@ class FFNBlock:
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out
-    return self.ffn_down(_silu_gate(self.ffn_gate(x)) * self.ffn_up(x))
+    gate, up = Linear.project(x, self.ffn_gate, self.ffn_up)
+    return self.ffn_down(_silu_gate(gate) * up)
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
@@ -205,8 +206,9 @@ class TransformerBlock(FFNBlock):
     if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+    q, k, v = Linear.project(x, self.attn_q, self.attn_k, self.attn_v)
     # v gets its own kernel: fused into the stacked KV cache store, the k half of the store would also run the v matmul
-    q, k, v = self.attn_q(x), self.attn_k(x), _own_kernel(self.attn_v(x))
+    v = _own_kernel(v)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
