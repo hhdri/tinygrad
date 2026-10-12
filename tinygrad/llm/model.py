@@ -5,7 +5,7 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, silu_gate, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import nv_flash_attention, nv_flash_attention_supported, nv_mmq_supported
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
-from tinygrad.uop.ops import resolve
+from tinygrad.uop.ops import resolve, Ops
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -428,17 +428,28 @@ class Transformer:
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
+    # prefill from a slice of a host-side token buffer (generate): the whole buffer goes in, see forward's n
+    self.chunk_jit = TinyJit(self.forward)
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, n:int|UOp|None=None) -> Tensor:
+    # n: tokens is a whole host-side sequence and this step reads n of them from start_pos, copied and sliced inside the JIT
+    out_device = tokens.device if n is None else Device.DEFAULT
+    tokens = tokens.to(self.token_embd.weight.device)
+    if n is not None: tokens = tokens[:, start_pos:start_pos+n]
+    x = self.token_embd(tokens).float()  # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
     # only run the output projection on the last token
-    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device)
+    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(out_device)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     # realize the noisy logits: argmax reads its input twice, and the vocab size can split the reduction poorly
+    temperature = temperature.to(logits.device)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).contiguous().argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    # a slice from start_pos of a realized host buffer (generate's tokens) goes in whole and is copied and sliced inside the JIT:
+    # realizing the slice first would schedule a copy on every call
+    if tokens.device == "PYTHON" and (u:=tokens.uop).op is Ops.SHRINK and u.src[0].is_realized and u.marg[1][0] is start_pos:
+      return self.chunk_jit(Tensor(u.src[0]), start_pos, temperature, tokens.shape[1])
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
@@ -565,9 +576,9 @@ class Transformer:
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
-    temp = Tensor([temperature])
-    # assign all input tokens once, then slice from start_pos for the model call
-    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
+    # tokens and temperature stay host-side (PYTHON tensors are realized when created); prefill slices the tokens from start_pos
+    temp = Tensor([temperature], device="PYTHON")
+    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32", device="PYTHON").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
