@@ -75,5 +75,15 @@ class TestCUDAFailures(unittest.TestCase):
     self.assertIn('ldmatrix.sync.aligned.m8n8.x4.shared.b16', src)
     self.assertIn('"memory"', src)
 
+  def test_ldmatrix_trans_load(self):
+    # ldmatrix_x4_trans loads each 8x8 matrix transposed (an MMA B fragment from a row-major tile)
+    def kernel(out, inp, lane, buf):
+      buf = buf.after(UOp.group(*[buf[lane*8+i].store(inp[lane*8+i]) for i in range(8)]).barrier())
+      frag = UOp(Ops.SHRINK, src=(buf, lane*8, UOp.const(4))).load(arg="ldmatrix_x4_trans")
+      return UOp.group(*[out[lane*4+i].store(frag[i]) for i in range(4)]).end(lane).sink(arg=KernelInfo(name="ldm", opts_to_apply=()))
+    src = self._render(kernel)
+    self.assertIn("tg_ldmatrix_x4_trans(", src)
+    self.assertIn('ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16', src)
+
 if __name__ == '__main__':
   unittest.main()
