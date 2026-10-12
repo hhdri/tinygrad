@@ -104,9 +104,9 @@ class Linear(nn.Linear):
     self.shard_axis = decoded.uop.axis
     self.weight = Tensor(raw).flatten().bitcast(word_dtype).contiguous()
   @staticmethod
-  def project(x:Tensor, *layers:nn.Linear) -> list[Tensor]:
-    # projections of one input: on NVIDIA its q8 quantization is shared, so it runs once
-    q8:dict = {}
+  def project(x:Tensor, *layers:nn.Linear, q8:dict|None=None) -> list[Tensor]:
+    # projections of one input: on NVIDIA its q8 quantization is shared, so it runs once (q8: already quantized, e.g. with the norm)
+    q8 = {} if q8 is None else q8
     return [l(x, q8) if isinstance(l, Linear) else l(x) for l in layers]
 
   def swiglu(self, gate:Tensor, up:Tensor) -> Tensor:

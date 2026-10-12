@@ -2,7 +2,7 @@ import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid, flash_attention
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq, nv_flash_attention, nv_mmq_supported, nv_qk_prep
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq, nv_flash_attention, nv_mmq_supported, nv_qk_prep, nv_rmsnorm_q8
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
@@ -183,6 +183,27 @@ class TestNVQuantLinear(unittest.TestCase):
         want[0, 0, :, sp] = ref(k, HKV, kw).half().numpy()[0, :, 0]
         want[1, 0, :, sp] = v.reshape(HKV, D).half().numpy()
         np.testing.assert_allclose(got.astype(np.float32), want.astype(np.float32), atol=2e-3, rtol=2e-3)
+
+  def test_rmsnorm_q8(self):
+    # one decode token: the residual sum, RMS norm and q8 quantization kernel vs the generic norm (dequantized within a step)
+    rng = np.random.default_rng(4)
+    D, eps = 4096, 1e-6
+    x, a = (Tensor(rng.normal(size=(1, 1, D)).astype(np.float32)*3).realize() for _ in range(2))
+    w = Tensor(rng.normal(size=(D,)).astype(np.float32)).realize()
+    for parts, write_sum, write_normed in (([x, a], True, False), ([x], False, True)):
+      with self.subTest(parts=len(parts)):
+        h, xn, q8 = nv_rmsnorm_q8(parts, w, eps, write_sum=write_sum, write_normed=write_normed)
+        xq, xd, xs = q8[(1, D, True)]
+        Tensor.realize(*(t for t in (h, xn, xq, xd, xs) if t is not None))
+        s_ = (x + a if len(parts) == 2 else x).numpy().reshape(D)
+        ref = s_ * (1/np.sqrt((s_.astype(np.float64)**2).mean() + eps)) * w.numpy()
+        if write_sum: np.testing.assert_allclose(h.numpy().reshape(D), s_, atol=1e-6, rtol=1e-6)
+        if write_normed: np.testing.assert_allclose(xn.numpy().reshape(D), ref, atol=1e-4, rtol=1e-4)
+        q = xq.numpy().reshape(-1).view(np.int8).astype(np.float32)
+        d = np.repeat(xd.numpy().reshape(-1), 32)
+        np.testing.assert_allclose(q*d, ref, atol=float(d.max())*0.51)
+        sums = q.reshape(-1, 16).sum(-1)
+        np.testing.assert_allclose(xs.numpy().reshape(-1), sums)
 
   def test_swiglu(self):
     # silu(gate)*up quantized inside the q8 kernel vs the product as an ordinary input: decode, static and symbolic prefill (gate and up

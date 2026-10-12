@@ -3,7 +3,8 @@ import enum, functools, itertools, math, pathlib, re
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, silu_gate, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.nv import nv_flash_attention, nv_flash_attention_supported, nv_mmq_supported, nv_qk_prep, nv_qk_prep_supported
+from tinygrad.llm.kernels.nv import nv_flash_attention, nv_flash_attention_supported, nv_mmq_supported, nv_qk_prep, nv_qk_prep_supported, \
+  nv_rmsnorm_q8, nv_rmsnorm_q8_supported
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
 from tinygrad.uop.ops import resolve, Ops
 
@@ -143,7 +144,7 @@ class FFNBlock:
       self.ffn_up      = Linear(config.dim, config.hidden_dim, bias=False)
       self.ffn_down    = Linear(config.hidden_dim, config.dim, bias=False)
 
-  def _feed_forward(self, x:Tensor) -> Tensor:
+  def _feed_forward(self, x:Tensor, q8:dict|None=None) -> Tensor:
     if hasattr(self, 'ffn_gate_exps'):
       h = x.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       logits = self.ffn_gate_inp(x)
@@ -172,20 +173,32 @@ class FFNBlock:
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out
-    gate, up = Linear.project(x, self.ffn_gate, self.ffn_up)
+    gate, up = Linear.project(x, self.ffn_gate, self.ffn_up, q8=q8)
     return self.ffn_down.swiglu(gate, up)
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
   def _init_state(self, x:Tensor): raise NotImplementedError
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
+  def _attention(self, x:Tensor, start_pos:int|UOp, q8:dict|None=None) -> Tensor: raise NotImplementedError
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
     self._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
+      # NVIDIA decode: the attention norm and its q8 quantization in one kernel (the normed input still feeds dense projections)
+      if (wa:=self.attn_norm.weight) is not None and nv_rmsnorm_q8_supported(x, self.config.dim):
+        _, xn, q8a = nv_rmsnorm_q8([x], wa, self.attn_norm.eps, write_normed=True)
+        assert xn is not None
+        attn = self._attention(xn, start_pos, q8=q8a)
+      else: attn = self._attention(self.attn_norm(x), start_pos)
+      # NVIDIA decode: the residual sum, the FFN norm and the q8 quantization of the gate/up input in one kernel
+      if not hasattr(self, 'ffn_gate_exps') and isinstance(self.ffn_gate, Linear) and self.ffn_gate.use_custom_quant and \
+         (w:=self.ffn_norm.weight) is not None and nv_rmsnorm_q8_supported(x, self.config.dim):
+        h, _, q8 = nv_rmsnorm_q8([x, attn], w, self.ffn_norm.eps, write_sum=True)
+        assert h is not None
+        return (h + self._feed_forward(self.ffn_norm(h), q8=q8)).contiguous()
+      h = x + attn
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
@@ -204,8 +217,8 @@ class TransformerBlock(FFNBlock):
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
     if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
 
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    q, k, v = Linear.project(x, self.attn_q, self.attn_k, self.attn_v)
+  def _attention(self, x:Tensor, start_pos:int|UOp, q8:dict|None=None) -> Tensor:
+    q, k, v = Linear.project(x, self.attn_q, self.attn_k, self.attn_v, q8=q8)
     B, T, _ = x.shape
     cfg = self.config
     # NVIDIA decode: q/k norm, rope and the KV cache write in one kernel, then the flash-decoding kernel
@@ -293,7 +306,7 @@ class MLATransformerBlock(FFNBlock):
     self.attn_v_b = {"weight": Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)}
     self.attn_output = Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:int|UOp, q8:dict|None=None) -> Tensor:
     B, T, _ = x.shape
     q_nope_head_dim = self.config.head_dim - self.config.rope_dim
     q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
@@ -345,7 +358,7 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:int|UOp, q8:dict|None=None) -> Tensor:
     B, T, _ = x.shape
     # bind ints to a variable so the reset flag stays a runtime value (it toggles when generation restarts at position 0)
     start_pos = start_pos if isinstance(start_pos, UOp) else UOp.variable("start_pos", 0, self.config.max_context-1).bind(start_pos)

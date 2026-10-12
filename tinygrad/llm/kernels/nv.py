@@ -583,6 +583,58 @@ def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type
                             small_tail=tail[2], **({"WR": 4} if ggml_type == Q4_K else {}))
   return Tensor.custom_kernel(out, weight, xq, xd, xs, fxn=fxn)[0][:tokens].reshape(*shape, out_features)
 
+# ******** decode: residual sum, RMS norm and q8 quantization in one kernel ********
+
+@functools.cache
+def _rmsnorm_q8_kernel(xq:UOp, xd:UOp, xs:UOp, *rest:UOp, n_parts:int, dim:int, eps:float, write_sum:bool, write_normed:bool) -> UOp:
+  # one decode token: x = sum of the parts (the residual stream), its RMS norm with the weight, then the q8 quantization of
+  # q8_quantize (group-major scales and sums). One block of 8 warps; warp w owns 128-value chunks w, w+8, ...; the sum of squares
+  # reduces over each warp and then across the warps through shared memory.
+  outs = list(rest[:int(write_sum)+int(write_normed)])
+  parts, weight = rest[len(outs):len(outs)+n_parts], rest[-1]
+  warps, chunks = 8, dim//128
+  lane, warp = UOp.range(32, -1, AxisType.WARP), UOp.range(warps, 1, AxisType.LOCAL)
+  idx = [(warp + warps*c)*128 + lane*4 + i for c in range(chunks//warps) for i in range(4)]
+  vals = [functools.reduce(UOp.__add__, (p[j].load() for p in parts)) for j in idx]
+  red = UOp.alloc((warps,), dtypes.float32, addrspace=AddrSpace.LOCAL)
+  red = red.after(red[warp.valid(lane.eq(0))].store(warp_reduce(sum((v*v for v in vals[1:]), vals[0]*vals[0]))).barrier())
+  rms = (sum((red[w].load() for w in range(1, warps)), red[0].load())/dim + eps).rsqrt()
+  stores = []
+  for c in range(chunks//warps):
+    chunk = warp + warps*c
+    v = vals[c*4:c*4+4]
+    normed = [x*rms*weight[j].load().float() for x, j in zip(v, idx[c*4:c*4+4])]
+    if write_sum: stores += [outs[0][j].store(x) for x, j in zip(v, idx[c*4:c*4+4])]
+    if write_normed: stores += [outs[-1][j].store(x) for x, j in zip(normed, idx[c*4:c*4+4])]
+    amax = functools.reduce(UOp.maximum, (x.abs() for x in normed))
+    d = _custom("({0}/127.0f)", dtypes.float, warp_reduce(amax, maximum=True, width=8)).maximum(1e-30)
+    quants = [_custom("rintf({0}/{1})", dtypes.float, x, d).clip(-127, 127) for x in normed]
+    word = functools.reduce(UOp.bitwise_or, (q.cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i,q in enumerate(quants)))
+    group, w = chunk*4 + lane//8, lane%8
+    stores += [xq[0, chunk*32 + lane].store(word), xd[group.valid(w.eq(0)), 0].store(d),
+               xs[group*2 + (w//4).valid((w%4).eq(0)), 0].store(warp_reduce(sum(quants[1:], quants[0]), width=4))]
+  return UOp.group(*stores).end(lane, warp).sink(arg=KernelInfo(name="rmsnorm_q8", opts_to_apply=()))
+
+def nv_rmsnorm_q8_supported(x:Tensor, dim:int) -> bool:
+  return nv_custom_kernels_supported(x.device) and isinstance(x.device, str) and dim % 1024 == 0 and isinstance(n:=x.numel(), int) and n == dim
+
+def nv_rmsnorm_q8(parts:list[Tensor], weight:Tensor, eps:float, write_sum:bool=False, write_normed:bool=False) -> tuple[Tensor|None,
+                  Tensor|None, dict]:
+  # one decode token: returns the sum of the parts (if write_sum), the normed input (if write_normed) and a q8 cache for
+  # Linear.project, whose packed projections then skip their own quantization
+  dim, dev = int(parts[0].numel()), parts[0].device
+  xq = Tensor.empty(1, dim//4, dtype=dtypes.uint32, device=dev)
+  xd, xs = Tensor.empty(dim//32, 1, dtype=dtypes.float32, device=dev), Tensor.empty(dim//16, 1, dtype=dtypes.float32, device=dev)
+  extra = [Tensor.empty(dim, dtype=dtypes.float32, device=dev) for _ in range(int(write_sum)+int(write_normed))]
+  fxn = functools.partial(_rmsnorm_q8_kernel, n_parts=len(parts), dim=dim, eps=eps, write_sum=write_sum, write_normed=write_normed)
+  # the weight goes in as stored (a float cast here would be a kernel per call), the kernel converts it
+  outs = Tensor.custom_kernel(xq, xd, xs, *extra, *(p.reshape(dim).float().contiguous() for p in parts), weight.contiguous(), fxn=fxn)
+  xq, xd, xs, extra = outs[0], outs[1], outs[2], outs[3:3+len(extra)]
+  shape = parts[0].shape
+  h = extra[0].reshape(shape) if write_sum else None
+  xn = extra[-1].reshape(shape) if write_normed else None
+  return h, xn, {(1, dim, True): (xq, xd, xs)}
+
 # ******** decode: attention prologue ********
 
 @functools.cache
@@ -601,7 +653,7 @@ def _qk_prep_kernel(q_out:UOp, cache:UOp, q:UOp, k:UOp, v:UOp, q_norm:UOp, k_nor
   e0 = lane*per  # first of this lane's head elements
   vals = [is_q.where(q[row.minimum(heads-1)*D + e0 + i].load(), k[kv_row*D + e0 + i].load()) for i in range(per)]
   rms = (warp_reduce(sum((x*x for x in vals[1:]), vals[0]*vals[0]))/D + eps).rsqrt()
-  normed = [x*rms*is_q.where(q_norm[e0+i].load(), k_norm[e0+i].load()) for i, x in enumerate(vals)]
+  normed = [x*rms*is_q.where(q_norm[e0+i].load().float(), k_norm[e0+i].load().float()) for i, x in enumerate(vals)]
   partner = [_shfl_xor(x, 16) for x in normed]
   first = lane < 16
   out = []
@@ -624,8 +676,9 @@ def nv_qk_prep(q:Tensor, k:Tensor, v:Tensor, q_norm:Tensor, k_norm:Tensor, freqs
   q_out = Tensor.empty(heads*head_dim, dtype=dtypes.half, device=q.device)
   fxn = functools.partial(_qk_prep_kernel, start_pos=start_pos, heads=heads, kv_heads=kv_heads, head_dim=head_dim, eps=eps)
   freqs = Tensor(freqs.float().contiguous().uop.after(start_pos))  # an input carries the start_pos binding into the kernel
-  q_out, kv = Tensor.custom_kernel(q_out, cache_kv, *(t.reshape(-1).float().contiguous() for t in (q, k, v)), q_norm.float().contiguous(),
-                                   k_norm.float().contiguous(), freqs, fxn=fxn)[:2]
+  # the norm weights go in as stored (a float cast here would be a kernel per call), the kernel converts them
+  q_out, kv = Tensor.custom_kernel(q_out, cache_kv, *(t.reshape(-1).float().contiguous() for t in (q, k, v)), q_norm.contiguous(),
+                                   k_norm.contiguous(), freqs, fxn=fxn)[:2]
   return q_out.reshape(1, heads, 1, head_dim), kv
 
 # ******** prefill: flash attention ********
