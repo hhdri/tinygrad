@@ -7,7 +7,7 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv, nv_mmq, nv_mmq_supported
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -122,13 +122,20 @@ class Linear(nn.Linear):
         and self.in_features % 256 == 0 and self.out_features % 4 == 0:
         if isinstance(numel:=x.numel(), int) and numel == self.in_features:
           out = nv_f16_gemv(weight, x, self.in_features, self.out_features)
-          return out if self.bias is None else out + self.bias
-        return super().__call__(x)
+        # prefill: F16 activations with F32 accumulation run on tensor cores; F32 activations would promote the weight to F32.
+        # contiguous() turns the uint8 GGUF view into a zero-copy F16 buffer view: through the bitcast the matmul loaded bytes.
+        else: out = x.cast(dtypes.float16).matmul(weight.contiguous().T, dtype=dtypes.float32)
+        return out if self.bias is None else out + self.bias
       if not nv_linear_supported(self.ggml_type, self.in_features, self.out_features):
         self.use_custom_quant, self.weight, self.ggml_type = False, self.dense, None
         return super().__call__(x)
     assert self.ggml_type is not None
     numel = x.numel()
+    if prod(x.max_shape) > self.in_features and self.out_features % 16 == 0 and nv_mmq_supported(self.weight.device):
+      out = nv_mmq(self.weight, x if isinstance(numel, int) else x.pad_to(x.max_shape),
+                   self.in_features, self.out_features, self.ggml_type, None if isinstance(numel, int) else numel//self.in_features)
+      if not isinstance(numel, int): out = out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+      return out if self.bias is None else out + self.bias
     if not isinstance(numel, int) or numel != self.in_features: return x.linear(self.dense.T, self.bias)
     out = nv_q8_linear(self.weight, self.ggml_type, x, self.in_features, self.out_features)
     return out if self.bias is None else out + self.bias

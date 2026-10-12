@@ -2,7 +2,7 @@ import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
@@ -120,6 +120,44 @@ class TestNVQuantLinear(unittest.TestCase):
   def setUp(self):
     if not nv_custom_kernels_supported(Device.DEFAULT): self.skipTest("NV or CUDA (sm_61+) required")
 
+  def test_mmq(self):
+    if int(Device[Device.DEFAULT].renderer.target.arch[3:]) < 80: self.skipTest("SM80 required")
+    rng = np.random.default_rng(42)
+    # shapes cover 1-4 row and token tiles per warp, 1-2 row and 1-4 token warps per block, and padded tokens
+    for typ,(k,n,t) in itertools.product((12,14), ((256,16,8), (1024,32,16), (256,16,3), (512,128,128), (256,48,40))):
+      for d,dmin,zero in ((0.001,0.0002,False), (-0.01,-0.002,False), (0.001,0.0002,True)):
+        with self.subTest(typ=typ, k=k, n=n, tokens=t, d=d, zero=zero):
+          packed = rng.integers(0,256,(n*k//256,QUANT_SIZES[typ]),dtype=np.uint8)
+          if typ == 12: packed[:,:4] = np.array([d,dmin],np.float16).view(np.uint8)
+          else: packed[:,-2:] = np.array([d],np.float16).view(np.uint8)
+          raw = Tensor(packed.ravel()).realize()
+          weight = ggml_data_to_tensor(raw,n*k,typ).reshape(n,k).numpy().astype(np.float64)
+          x = rng.normal(size=(t,k)).astype(np.float32)
+          if zero: x.fill(0)
+          grouped = x.reshape(t,-1,32)
+          scale = np.maximum(np.abs(grouped).max(-1,keepdims=True)/127,1e-30)
+          reference = (np.rint(grouped/scale)*scale).reshape(t,k).astype(np.float64) @ weight.T
+          actual = nv_mmq(raw.bitcast(dtypes.uint32 if typ == 12 else dtypes.uint16),Tensor(x),k,n,typ).numpy()
+          np.testing.assert_allclose(actual,reference,atol=2e-4,rtol=2e-4)
+
+  def test_mmq_symbolic_dispatch(self):
+    if int(Device[Device.DEFAULT].renderer.target.arch[3:]) < 80: self.skipTest("SM80 required")
+    rng = np.random.default_rng(11)
+    for typ in (12,14):
+      # 256 padded tokens span two 128-token blocks: 3 and 16 live tokens launch only the first, 130 both
+      for tokens in (3,16,130):
+        with self.subTest(typ=typ, tokens=tokens):
+          packed = rng.integers(0,256,(16*1024//256,QUANT_SIZES[typ]),dtype=np.uint8)
+          if typ == 12: packed[:,:4] = np.array([.001,.0002],np.float16).view(np.uint8)
+          else: packed[:,-2:] = np.array([.001],np.float16).view(np.uint8)
+          raw = Tensor(packed.ravel()).realize()
+          layer = Linear(1024,16,bias=False)
+          layer.weight = ggml_data_to_tensor(raw,16*1024,typ).reshape(16,1024)
+          x = rng.normal(size=(tokens,1024)).astype(np.float32)
+          inp = Tensor(np.pad(x,((0,256-tokens),(0,0)))).contiguous()[:UOp.variable("mmq_tokens",1,256).bind(tokens)]
+          actual = function(lambda x: layer(x), allow_implicit=True)(inp)[:tokens].numpy()
+          np.testing.assert_allclose(actual,layer(Tensor(x)).numpy(),atol=2e-4,rtol=2e-4)
+
   def test_dense_decode(self):
     rng = np.random.default_rng(3)
     for k, n in ((256, 4), (4096, 64), (4096, 1024), (768, 7), (384, 4)):
@@ -132,8 +170,9 @@ class TestNVQuantLinear(unittest.TestCase):
           linear.bias = Tensor(bias)
           for tokens in (1, 3):
             x = rng.normal(size=(1, tokens, k)).astype(dtype)
-            np.testing.assert_allclose(linear(Tensor(x)).numpy(), x.astype(np.float32) @ weight.astype(np.float32).T + bias,
-                                       rtol=2e-4, atol=2e-4)
+            # prefill is an F16 matmul with F32 accumulation; without tensor cores the products round to F16
+            ref_x, tol = (x.astype(np.float16).astype(np.float32), 1e-3*np.sqrt(k)) if tokens > 1 else (x.astype(np.float32), 2e-4)
+            np.testing.assert_allclose(linear(Tensor(x)).numpy(), ref_x @ weight.astype(np.float32).T + bias, rtol=tol, atol=tol)
           np.testing.assert_allclose(linear(Tensor.zeros(1, k)).numpy(), bias[None], atol=1e-6)
 
   def test_dense_extreme_values(self):
