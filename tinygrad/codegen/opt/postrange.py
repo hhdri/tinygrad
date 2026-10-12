@@ -99,6 +99,9 @@ class Scheduler:
             f"invalid split arg {opt.arg}")
       if new_type is AxisType.LOCAL: check(self.ren.has_local, "locals needed for opt")
 
+      # a symbolic size can't be split exactly: pad it to a multiple of amt first, so one SPLIT action reaches the split
+      if amt != 0 and rng.src[0].op is not Ops.CONST and rng.src[0].divides(amt) is None:
+        rng = self.apply_opt(Opt(OptOps.PADTO, cast(int, opt.axis), amt), append_opt=False)
       if amt == 0: amt = int(rng.vmax+1)
       is_reduce = rng in self.reduce_ranges
       if new_type is AxisType.UPCAST:
@@ -127,14 +130,15 @@ class Scheduler:
       check(ret is not None, "no tensor core available")
     elif opt.op is OptOps.PADTO:
       check(type(opt.arg) is int and opt.arg > 1, f"padto arg is a multiple > 1, not {opt.arg}")
-      check(rng.src[0].op is Ops.CONST, "only pad const axes")
       # TODO: upcasted is only wrong for a range pinned in WMMA tc_upcast_axes
       check(rng.axis_type not in {AxisType.UPCAST, AxisType.WARP}, "cannot pad upcasted or warp")
-      new_sz = round_up(int(rng.vmax+1), cast(int, opt.arg))
-      check(rng.vmax+1 > new_sz//4, "pad adds more than quadruple the work")
-      replaced_rng = rng.replace(src=(rng.src[0].const_like(new_sz),))
+      # a symbolic size n pads to (n+arg-1)//arg*arg, which later splits divide symbolically
+      size, amt = rng.src[0], cast(int, opt.arg)
+      new_size = size.const_like(round_up(int(rng.vmax+1), amt)) if size.op is Ops.CONST else (size+(amt-1))//amt*amt
+      check(rng.vmax+1 > (new_size.vmax+1)//4, "pad adds more than quadruple the work")
+      replaced_rng = rng.replace(src=(new_size,))
       replaces = {rng:replaced_rng}
-      valid = replaced_rng < rng.vmax+1
+      valid = replaced_rng < size
       for b in self.bufs:
         if rng in (i:=b.src[1]).ranges: replaces[b] = b.replace(src=(b.src[0], i.get_idx().valid(valid&i.get_valid())))
       for r in self.reduceops:
@@ -185,8 +189,10 @@ class Scheduler:
           ast, warp, ne = self.ast, UOp.range(tc.threads, -1, AxisType.WARP), {}
           try:
             for i,a in enumerate(axes):
-              if (a.vmax+1) % tc.dims[i] != 0:
-                if opt_level < 2: raise KernelOptError("tc padding requires opt_level >= 2")
+              # a symbolic size can have a divisible max and still need padding
+              if a.src[0].divides(tc.dims[i]) is None:
+                # padding is the only way a symbolic size reaches the tensor cores, so it doesn't need opt_level 2
+                if opt_level < 2 and a.src[0].op is Ops.CONST: raise KernelOptError("tc padding requires opt_level >= 2")
                 axes[i] = self.apply_opt(Opt(OptOps.PADTO, self.rngs.index(a), tc.dims[i]), append_opt=False) # PADTO might fail
             # we create the warp as a whole thing, in case some of these ranges are moved/removed later
             for c in tc.axis_coords():
