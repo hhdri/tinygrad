@@ -1,4 +1,4 @@
-import hashlib, math, time, traceback, signal
+import math, time, traceback, signal
 from dataclasses import replace
 from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.device import Device, Buffer
@@ -101,15 +101,10 @@ def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dic
     except KernelOptError: pass
   return acted
 
-def legal_actions_fingerprint(s:Scheduler) -> str:
-  # a cached schedule was chosen among the actions legal when it was searched: a kernel whose legal actions changed (e.g. a new
-  # tensor core path) searches again, while unrelated changes to the optimizer keep the cache
-  return hashlib.sha256(repr([actions[i-1] for i in get_kernel_actions(s, include_0=False)]).encode()).hexdigest()[:16]
-
 BEAM_DEBUG = getenv("BEAM_DEBUG")
 def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:int, allow_test_size=True):
   key = {"ast": s.ast.key, "amt": amt, "allow_test_size": allow_test_size, "device": s.ren.target.device,
-         "suffix": f"{s.ren.suffix}_tf32_{ALLOW_TF32.value}_actions_{legal_actions_fingerprint(s)}"}
+         "suffix": f"{s.ren.suffix}_tf32_{ALLOW_TF32.value}"}
   if not IGNORE_BEAM_CACHE and CACHELEVEL >= 1 and (val:=diskcache_get("beam_search", key)) is not None:
     ret = s.copy()
     for o in val[len(s.applied_opts):]: ret.apply_opt(o)
