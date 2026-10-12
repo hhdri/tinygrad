@@ -1,7 +1,7 @@
 import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid, flash_attention
 from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq, nv_flash_attention, nv_mmq_supported
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
@@ -250,5 +250,22 @@ class TestNVFlashAttention(unittest.TestCase):
         k, v = (np.repeat(cache[i, :, :, :start+T].astype(np.float64), H//KVH, axis=1) for i in range(2))
         scores = q.astype(np.float16).astype(np.float64) @ k.transpose(0, 1, 3, 2) / np.sqrt(D)
         scores[..., np.arange(start+T)[None, :] > (start + np.arange(T))[:, None]] = -np.inf
+        probs = np.exp(scores - scores.max(-1, keepdims=True))
+        np.testing.assert_allclose(actual, (probs / probs.sum(-1, keepdims=True)) @ v, atol=5e-3, rtol=5e-3)
+
+  def test_flash_attention_decode(self):
+    # single-token attention over the half KV cache vs float64 NumPy: Qwen3's 4-query GQA group, chunk boundaries, a context longer
+    # than one round of partial chunks, and a symbolic length
+    rng = np.random.default_rng(1)
+    B, H, KVH, D, N = 1, 8, 2, 128, 4096
+    for L, symbolic in ((1, False), (31, False), (32, False), (33, False), (560, True), (2049, False), (4096, True)):
+      with self.subTest(L=L, symbolic=symbolic):
+        cache = np.zeros((2, B, KVH, N, D), np.float16)
+        cache[:, :, :, :L] = rng.standard_normal((2, B, KVH, L, D)).astype(np.float16)
+        q = rng.standard_normal((B, H, 1, D)).astype(np.float32)
+        end = UOp.variable("start_pos", 0, N-1).bind(L-1) + 1 if symbolic else L
+        actual = flash_attention(Tensor(q).realize(), Tensor(cache).realize(), end).numpy()
+        k, v = (np.repeat(cache[i, :, :, :L].astype(np.float64), H//KVH, axis=1) for i in range(2))
+        scores = q.astype(np.float16).astype(np.float64) @ k.transpose(0, 1, 3, 2) / np.sqrt(D)
         probs = np.exp(scores - scores.max(-1, keepdims=True))
         np.testing.assert_allclose(actual, (probs / probs.sum(-1, keepdims=True)) @ v, atol=5e-3, rtol=5e-3)
