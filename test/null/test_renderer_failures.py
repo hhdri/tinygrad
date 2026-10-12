@@ -3,7 +3,7 @@ from tinygrad.device import Device
 from tinygrad.dtype import dtypes
 from tinygrad.codegen import to_program
 from tinygrad.helpers import Target
-from tinygrad.renderer.cstyle import CStyleLanguage
+from tinygrad.renderer.cstyle import CStyleLanguage, CUDARenderer
 from tinygrad.renderer.wgsl import WGSLRenderer
 from test.helpers import check_schedule
 from tinygrad.uop.ops import UOp, Ops, KernelInfo, python_alu
@@ -41,6 +41,16 @@ class TestWGSLFailures(unittest.TestCase):
     src = WGSLRenderer(Target("WEBGPU")).render(UOp.sink(store, arg=KernelInfo()).toposort())
     self.assertIn("atomicAnd(&data0_4[0],4294967040u);", src)
     self.assertNotIn("atomicAdd", src)
+
+class TestCUDAFailures(unittest.TestCase):
+  def test_guarded_vector_load_inline_zero(self):
+    # a named zero vector as the fallback of guarded vector loads makes nvcc spill it and select between pointers, demoting the
+    # predicated global loads to generic loads (a symbolic F16 matmul ran 30% slower); the constant must render inline
+    a, b = (Tensor.empty(30, 64, dtype=dtypes.half).pad(((0, 2), (0, 0))) for _ in range(2))
+    linear, _ = check_schedule((a + b).contiguous(), 1)
+    src = to_program(linear.src[0].src[0], CUDARenderer(Target("CUDA", arch="sm_89"))).src[2].arg
+    self.assertEqual(src.count(":make_half4("), 2)
+    self.assertNotIn("half4 cast", src)
 
 if __name__ == '__main__':
   unittest.main()
