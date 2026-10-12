@@ -222,9 +222,10 @@ class TransformerBlock(FFNBlock):
       attn = flash_attention(q, assigned_kv, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
-    # on NVIDIA, causal prefill attention without windows or sinks runs on the KV cache in the NV flash attention kernel
-    if not self.config.sliding_window and not hasattr(self, 'attn_sinks') and resolve(T != 1) and nv_flash_attention_supported(q, assigned_kv):
-      attn = nv_flash_attention(q, assigned_kv, start_pos+T).transpose(1, 2).reshape(B, T, -1)
+    # on NVIDIA, attention without windows or sinks runs on the KV cache: causal prefill in the NV flash attention kernel, single-token
+    # decode in the flash-decoding kernel shared with RDNA
+    if not self.config.sliding_window and not hasattr(self, 'attn_sinks') and nv_flash_attention_supported(q, assigned_kv):
+      attn = (nv_flash_attention if resolve(T != 1) else flash_attention)(q, assigned_kv, start_pos+T).transpose(1, 2).reshape(B, T, -1)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
     k = assigned_kv[0, :, :, 0:start_pos+T, :]
     v = assigned_kv[1, :, :, 0:start_pos+T, :]

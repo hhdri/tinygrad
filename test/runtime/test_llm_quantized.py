@@ -1,7 +1,7 @@
 import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid, flash_attention
 from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_flash_attention, nv_mmq_supported
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
@@ -131,12 +131,12 @@ def _q8_reference(x:np.ndarray, weight:np.ndarray) -> np.ndarray:
   scale = np.maximum(np.abs(grouped).max(-1, keepdims=True) / np.float32(127), np.float32(1e-30))
   return (np.clip(np.rint(grouped/scale), -127, 127).astype(np.float64)*scale).reshape(x.shape) @ weight.astype(np.float64).T
 
-def _attention_reference(q:np.ndarray, cache:np.ndarray, start:int) -> np.ndarray:
-  # float64 causal attention of (B, H, T, D) half-rounded queries at positions start.. over the first start+T cache rows (GQA)
+def _attention_reference(q:np.ndarray, cache:np.ndarray, start:int, causal:bool) -> np.ndarray:
+  # float64 attention of (B, H, T, D) half-rounded queries at positions start.. over the first start+T cache rows (GQA)
   B, H, T, D = q.shape
   k, v = (np.repeat(cache[i, :, :, :start+T].astype(np.float64), H//cache.shape[2], axis=1) for i in range(2))
   scores = q.astype(np.float16).astype(np.float64) @ k.transpose(0, 1, 3, 2) / np.sqrt(D)
-  scores[..., np.arange(start+T)[None, :] > (start + np.arange(T))[:, None]] = -np.inf
+  if causal: scores[..., np.arange(start+T)[None, :] > (start + np.arange(T))[:, None]] = -np.inf
   probs = np.exp(scores - scores.max(-1, keepdims=True))
   return (probs / probs.sum(-1, keepdims=True)) @ v
 
@@ -234,6 +234,20 @@ class TestNVFlashAttention(unittest.TestCase):
           qin, end = (qt, start+T) if T == T_max else (qt[:, :, :v], start+v)
           out = nv_flash_attention(qin, Tensor(cache).realize(), end).realize()
           actual = np.frombuffer(out.uop.base.buffer.as_memoryview(), np.float32).reshape(B, H, T_max, D)[:, :, :T]
-        np.testing.assert_allclose(actual, _attention_reference(q, cache, start), atol=5e-3, rtol=5e-3)
+        np.testing.assert_allclose(actual, _attention_reference(q, cache, start, causal=True), atol=5e-3, rtol=5e-3)
+
+  def test_flash_attention_decode(self):
+    # single-token attention over the half KV cache: Qwen3's 4-query GQA group, chunk boundaries, a context longer than one round of
+    # partial chunks, symbolic lengths
+    rng = np.random.default_rng(1)
+    B, H, KVH, D, N = 1, 8, 2, 128, 4096
+    for L, symbolic in ((1, False), (31, False), (32, False), (33, False), (560, True), (2049, False), (4096, True)):
+      with self.subTest(L=L, symbolic=symbolic):
+        cache = np.zeros((2, B, KVH, N, D), np.float16)
+        cache[:, :, :, :L] = rng.standard_normal((2, B, KVH, L, D)).astype(np.float16)
+        q = rng.standard_normal((B, H, 1, D)).astype(np.float32)
+        end = UOp.variable("start_pos", 0, N-1).bind(L-1) + 1 if symbolic else L
+        actual = flash_attention(Tensor(q).realize(), Tensor(cache).realize(), end).numpy()
+        np.testing.assert_allclose(actual, _attention_reference(q, cache, L-1, causal=False), atol=5e-3, rtol=5e-3)
 
 if __name__ == "__main__": unittest.main()
