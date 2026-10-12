@@ -461,17 +461,18 @@ def _q6k_mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_fe
 
 @functools.cache
 def _q4k_mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_features:int, in_features:int, live:UOp|None=None,
-                    TN:int=64, TM:int=128, small_tail:int|None=None) -> UOp:
+                    TN:int=64, TM:int=128, small_tail:int|None=None, WR:int=2) -> UOp:
   # Q4_K counterpart of _q6k_mmq_kernel: 144-byte super-blocks are 16-byte aligned, so cp.async copies them directly; the nibbles are
   # unpacked per 128-weight half into a swizzled int8 tile; m16n8k32 MMAs, scale/min coefficients and token sums as in _mmq_kernel.
-  # 8 warps (2 row x 4 token) of TN/2 rows x TM/4 tokens.
-  threads, nsb, MT, NT = 256, in_features//256, TN//32, TM//32
+  # 8 warps: WR row x 8//WR token warps of TN/WR rows x TM*WR/8 tokens.
+  WT = 8//WR
+  threads, nsb, MT, NT = 256, in_features//256, TN//(WR*16), TM//(WT*8)
   n = None if live is None else live.unbind_all()[0]
   token_block = UOp.range(tokens//TM if n is None else _live_blocks(n, TM, small_tail), 1, AxisType.GLOBAL)
   row_block, lane = UOp.range(out_features//TN, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
   warp = UOp.range(8, 2, AxisType.LOCAL)
   tid, g8, t4 = warp*32+lane, lane//4, lane%4
-  row0, tok0, wr, tc = row_block*TN, token_block*TM, (warp//4)*(TN//2), (warp%4)*(TM//4)
+  row0, tok0, wr, tc = row_block*TN, token_block*TM, (warp//WT)*(TN//WR), (warp%WT)*(TM//WT)
   wq = UOp.alloc((TN, 32), dtypes.uint32, addrspace=AddrSpace.LOCAL)
   aq = UOp.alloc((TM, 32), dtypes.uint32, addrspace=AddrSpace.LOCAL)
   ws = UOp.alloc((4, TN, 2), dtypes.float32, addrspace=AddrSpace.LOCAL)
@@ -570,7 +571,8 @@ def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type
   xq, xd, xs = q8_quantize(x, padded_tokens, in_features, q8, up, live, group_major=ggml_type == Q4_K or v2)
   if live is not None: xq = Tensor(xq.uop.after(live))
   # a padded symbolic chunk whose live tokens end in a 1-64 token tail can run a 64-token-block cp.async kernel instead (no nearly empty
-  # 128-token block): 128 rows per block for Q4_K, 64 for Q6_K, whose raw tile is larger (two blocks per SM either way). Both kernels are
+  # 128-token block): 128 rows per block for Q4_K (4 row x 2 token warps: 1.5% faster than 2 x 4 here), 64 for Q6_K, whose raw tile is
+  # larger (two blocks per SM either way). Both kernels are
   # launched, and the one that doesn't apply gets no blocks. A 64-token block costs ~0.56x a 128-token one for Q4_K, so its 2k+1 blocks
   # win over k+1 for any chunk; ~0.6-0.65x for Q6_K, so only with at most one full block before the tail (live < 256)
   tail = {Q4_K: (_q4k_mmq_kernel, 128, padded_tokens+1), Q6_K: (_q6k_mmq_kernel, 64, 256)}.get(ggml_type) \
@@ -578,7 +580,7 @@ def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type
   if tail is not None and out_features % tail[1] == 0:
     out = Tensor.custom_kernel(out, weight, xq, xd, xs, fxn=functools.partial(fxn, small_tail=tail[2]))[0]
     fxn = functools.partial(tail[0], tokens=padded_tokens, out_features=out_features, in_features=in_features, live=live, TN=tail[1], TM=64,
-                            small_tail=tail[2])
+                            small_tail=tail[2], **({"WR": 4} if ggml_type == Q4_K else {}))
   return Tensor.custom_kernel(out, weight, xq, xd, xs, fxn=fxn)[0][:tokens].reshape(*shape, out_features)
 
 # ******** prefill: flash attention ********
