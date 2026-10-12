@@ -339,6 +339,7 @@ class NVKIface:
   fd_ctl: FileIOInterface
   fd_uvm: FileIOInterface
   count: int
+  driver_version: int = 0
   gpus_info: list|ctypes.Array = []
 
   # TODO: Need a proper allocator for va addresses
@@ -358,8 +359,9 @@ class NVKIface:
       NVKIface.root = self.rm_alloc(0, nv_gpu.NV01_ROOT_CLIENT, None, root=0)
 
       drvver = self.rm_control(self.root, nv_gpu.NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION_V2, nv_gpu.NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_V2_PARAMS())
-      if int(drvver.driverVersionBuffer.decode().split('.')[0], 10) >= 610: nv_gpu = nv_610
-      elif int(drvver.driverVersionBuffer.decode().split('.')[0], 10) >= 580: nv_gpu = nv_580
+      NVKIface.driver_version = int(drvver.driverVersionBuffer.decode().split('.')[0], 10)
+      if NVKIface.driver_version >= 610: nv_gpu = nv_610
+      elif NVKIface.driver_version >= 580: nv_gpu = nv_580
 
       self.uvm(nv_gpu.UVM_INITIALIZE, nv_gpu.UVM_INITIALIZE_PARAMS())
 
@@ -721,9 +723,10 @@ class NVDevice(Compiled):
   def invalidate_caches(self):
     if self.is_nvd(): self.iface.rm_control(self.subdevice, nv_gpu.NV2080_CTRL_CMD_INTERNAL_BUS_FLUSH_WITH_SYSMEMBAR, None)
     else:
+      # R615 widened APERTURE from 2 to 3 bits, shifting the remaining flush flags by one.
       self.iface.rm_control(self.subdevice, nv_gpu.NV2080_CTRL_CMD_FB_FLUSH_GPU_CACHE, nv_gpu.NV2080_CTRL_FB_FLUSH_GPU_CACHE_PARAMS(
-        flags=((nv_gpu.NV2080_CTRL_FB_FLUSH_GPU_CACHE_FLAGS_WRITE_BACK_YES << 2) | (nv_gpu.NV2080_CTRL_FB_FLUSH_GPU_CACHE_FLAGS_INVALIDATE_YES << 3) |
-              (nv_gpu.NV2080_CTRL_FB_FLUSH_GPU_CACHE_FLAGS_FLUSH_MODE_FULL_CACHE << 4))))
+        flags=nv_flags("NV2080_CTRL_FB_FLUSH_GPU_CACHE_FLAGS", write_back="yes", invalidate="yes", flush_mode="full_cache") <<
+              int(self.iface.driver_version >= 615)))
 
   def on_device_hang(self):
     # Prepare fault report.
