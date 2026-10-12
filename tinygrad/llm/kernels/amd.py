@@ -7,6 +7,7 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -55,14 +56,15 @@ def _reg(shape:tuple[int, ...], value:float, dep:UOp|None=None) -> UOp:
 
 class Linear(nn.Linear):
   ggml_type:int|None = None
+  raw_offset = 0  # byte offset of the packed view into the GGUF storage
   use_custom_quant = True
   shard_axis:int|None = None
   def __init__(self, in_features:int, out_features:int, bias=True):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
-  def set_quantized(self, decoded:Tensor):
+  def set_quantized(self, decoded:Tensor, types:tuple[int, ...]=tuple(QUANT_SIZES)):
     if self.in_features % GGML_BLOCK_SIZE: return
-    packed_sizes = {typ: decoded.numel() // 256 * type_size for typ,type_size in QUANT_SIZES.items()}
+    packed_sizes = {typ: decoded.numel() // 256 * QUANT_SIZES[typ] for typ in types}
     graph = decoded.uop.toposort()
     raw = next((u for u in graph if u.op in (Ops.SHRINK, Ops.BUFFER, Ops.UNSHARD) and u.dtype == dtypes.uint8 and
                 prod(u.shape) in packed_sizes.values()), None)
@@ -85,10 +87,11 @@ class Linear(nn.Linear):
     word_dtype = dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32
     raw_offset = raw.contiguous_view_offset()
     if raw_offset is None or raw_offset % word_dtype.itemsize or raw.buf_uop.dtype != dtypes.uint8: return
-    self.ggml_type = ggml_type
+    self.ggml_type, self.raw_offset = ggml_type, raw_offset
     self.shard_axis = decoded.uop.axis
     self.weight = Tensor(raw).flatten().bitcast(word_dtype).contiguous()
   def __call__(self, x:Tensor) -> Tensor:
+    if self.use_custom_quant and nv_custom_kernels_supported(self.weight.device): return self._nv_call(x)
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
@@ -108,6 +111,30 @@ class Linear(nn.Linear):
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return super().__call__(x)
+
+  def _nv_call(self, x:Tensor) -> Tensor:
+    if self.ggml_type is None:
+      # keep the lazy dequantization for the shapes the packed kernels don't cover
+      self.dense = self.weight
+      if isinstance(self.weight.device, str): self.set_quantized(self.weight, (Q4_K, Q6_K))
+      # Dense storage only: unsupported packed formats must keep their fused dequantization fallback.
+      if self.ggml_type is None and (weight:=_view_back(self.weight)).dtype == dtypes.float16 and weight.uop.contiguous_view() is not None \
+        and self.weight.uop.axis is None \
+        and self.in_features % 256 == 0 and self.out_features % 4 == 0:
+        if isinstance(numel:=x.numel(), int) and numel == self.in_features:
+          out = nv_f16_gemv(weight, x, self.in_features, self.out_features)
+        # prefill: F16 activations with F32 accumulation run on tensor cores; F32 activations would promote the weight to F32.
+        # contiguous() turns the uint8 GGUF view into a zero-copy F16 buffer view: through the bitcast the matmul loaded bytes.
+        else: out = x.cast(dtypes.float16).matmul(weight.contiguous().T, dtype=dtypes.float32)
+        return out if self.bias is None else out + self.bias
+      if not nv_linear_supported(self.ggml_type, self.in_features, self.out_features, self.raw_offset):
+        self.use_custom_quant, self.weight, self.ggml_type = False, self.dense, None
+        return super().__call__(x)
+    assert self.ggml_type is not None
+    numel = x.numel()
+    if not isinstance(numel, int) or numel != self.in_features: return x.linear(self.dense.T, self.bias)
+    out = nv_q8_linear(self.weight, self.ggml_type, x, self.in_features, self.out_features)
+    return out if self.bias is None else out + self.bias
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, src=(a, b, c), arg=("__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)", dtypes.int32))

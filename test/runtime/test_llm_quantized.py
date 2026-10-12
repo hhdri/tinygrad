@@ -2,13 +2,15 @@ import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
 class QuantLinearMixin:
   def _test_quant_linear(self, ggml_type, block_bytes, in_features=2048, out_features=64, token_counts=(1, 3, 32, 64, 128),
-                         bias=False, custom=True, symbolic=False):
-    if custom and not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+                         bias=False, custom=True, symbolic=False, offset=4):
+    nv = custom and nv_custom_kernels_supported(device:=Tensor.empty(1).device)
+    if custom and not (nv or amd_custom_kernels_supported(device)): self.skipTest("RDNA3 or NV required")
     rng = np.random.default_rng(42)
     packed = rng.integers(0, 256, (out_features*in_features//256, block_bytes), dtype=np.uint8)
     if ggml_type in (11, 14): packed[:, -2:] = np.array([0.001], dtype=np.float16).view(np.uint8)
@@ -18,7 +20,7 @@ class QuantLinearMixin:
     elif ggml_type == 20: packed.reshape(-1, 18)[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
     else: packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
     if ggml_type in (12, 13): packed[:, 2:4] = np.array([0.0002], dtype=np.float16).view(np.uint8)
-    raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
+    raw = Tensor(np.pad(packed.flatten(), (offset, 0))).contiguous().realize()[offset:]
     decoded = ggml_data_to_tensor(raw, out_features*in_features, ggml_type).reshape(out_features, in_features)
     weight = decoded.numpy()
     linear = Linear(in_features, out_features, bias=False)
@@ -31,7 +33,7 @@ class QuantLinearMixin:
       with self.subTest(tokens=tokens):
         x = rng.normal(size=(tokens, in_features)).astype(np.float32 if tokens == 3 else np.float16)
         reference_x = x.astype(np.float32)
-        wmma = custom and (32 if symbolic else tokens) % 16 == 0 and out_features % 16 == 0
+        wmma = custom and not nv and (32 if symbolic else tokens) % 16 == 0 and out_features % 16 == 0
         if wmma: reference_x = x.astype(np.float16).astype(np.float32)
         if custom and not wmma:
           grouped = reference_x.reshape(tokens, -1, 32)
@@ -108,10 +110,78 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
 
   @unittest.skipIf(Device.DEFAULT == "WEBGPU", "slow on WEBGPU")
   def test_quant_linear_fallback(self):
-    if amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("run with DISABLE_AMD_KERNELS=1")
+    if amd_custom_kernels_supported(dev:=Tensor.empty(1).device) or nv_custom_kernels_supported(dev):
+      self.skipTest("run with DISABLE_AMD_KERNELS=1 DISABLE_NV_KERNELS=1")
     # per-type dequant math on the generic path is covered by test_gguf, spot check a representative set here
     for typ in (12, 14, 17, 23):
       with self.subTest(ggml_type=typ):
         self._test_quant_linear(typ, QUANT_SIZES[typ], in_features=256, out_features=16, token_counts=(1, 3), bias=True, custom=False)
+
+def _packed(rng, typ, n, k, d=0.001, dmin=0.0002, offset=0):
+  # random ggml super-blocks with the given scales; offset: a view into the storage that is only halfword aligned
+  packed = rng.integers(0, 256, (n*k//256, QUANT_SIZES[typ]), dtype=np.uint8)
+  if typ == 14: packed[:, -2:] = np.array([d], np.float16).view(np.uint8)
+  else: packed[:, :4] = np.array([d, dmin], np.float16).view(np.uint8)
+  raw = Tensor(np.pad(packed.ravel(), (offset, 0))).contiguous().realize()[offset:]
+  return raw, ggml_data_to_tensor(raw, n*k, typ).reshape(n, k)
+
+def _q8_reference(x:np.ndarray, weight:np.ndarray) -> np.ndarray:
+  # quantize in float32 like the kernels (per-32 scale, rint): float64 division rounds some ties the other way
+  grouped = x.astype(np.float32).reshape(*x.shape[:-1], -1, 32)
+  scale = np.maximum(np.abs(grouped).max(-1, keepdims=True) / np.float32(127), np.float32(1e-30))
+  return (np.clip(np.rint(grouped/scale), -127, 127).astype(np.float64)*scale).reshape(x.shape) @ weight.astype(np.float64).T
+
+class TestNVQuantLinear(QuantLinearMixin, unittest.TestCase):
+  def setUp(self):
+    if not nv_custom_kernels_supported(Device.DEFAULT): self.skipTest("NV or CUDA (sm_61+) required")
+
+  def test_quant_linear(self):
+    # one token runs the dp4a GEMV. The kernels need 16-byte aligned views (GGUF tensor data is 32-byte aligned)
+    for typ in (12, 14):
+      with self.subTest(ggml_type=typ): self._test_quant_linear(typ, QUANT_SIZES[typ], token_counts=(1,), offset=16)
+
+  def test_edge_values(self):
+    # zero inputs, zero/negative/extreme scales: the GEMV vs NumPy
+    rng = np.random.default_rng(1)
+    xs = [np.zeros((1, 1, 2048), np.float32), rng.normal(size=(1, 1, 2048)).astype(np.float32) * np.repeat(rng.choice([0, 1e-3, 1, 300], 64), 32)]
+    for typ, (d, dmin) in itertools.product((12, 14), ((0.0, 0.0), (-0.75, 0.5), (60000.0, -60000.0), (6e-8, 3e-5))):
+      raw, decoded = _packed(rng, typ, 64, 2048, d, dmin)
+      linear = Linear(2048, 64, bias=False)
+      linear.weight = decoded
+      weight = decoded.numpy()
+      for x in xs:
+        with self.subTest(ggml_type=typ, d=d, dmin=dmin, tokens=x.shape[1]):
+          ref = _q8_reference(x, weight)
+          np.testing.assert_allclose(linear(Tensor(x)).numpy(), ref, rtol=2e-4, atol=2e-4*max(1.0, float(np.abs(ref).max())))
+      self.assertEqual(linear.ggml_type, typ)
+
+  def test_dense(self):
+    # F16 weights: the GEMV at one token (F16 and F32 activations, bias, extreme values), the F16 tensor-core matmul for more
+    rng = np.random.default_rng(3)
+    for k, n in ((256, 4), (4096, 64), (768, 7)):
+      weight = rng.normal(size=(n, k)).astype(np.float16)
+      linear = Linear(k, n, bias=True)
+      linear.weight, linear.bias = Tensor(weight).cast(dtypes.float32), Tensor(bias:=rng.normal(size=n).astype(np.float32))
+      for tokens, dtype in ((1, np.float16), (1, np.float32), (3, np.float32)):
+        with self.subTest(k=k, n=n, tokens=tokens, dtype=dtype):
+          x = rng.normal(size=(1, tokens, k)).astype(dtype)
+          # prefill is an F16 matmul with F32 accumulation; without tensor cores the products round to F16
+          ref_x, tol = (x.astype(np.float16).astype(np.float32), 1e-3*np.sqrt(k)) if tokens > 1 else (x.astype(np.float32), 2e-4)
+          np.testing.assert_allclose(linear(Tensor(x)).numpy(), ref_x @ weight.astype(np.float32).T + bias, rtol=tol, atol=tol)
+      np.testing.assert_allclose(linear(Tensor.zeros(1, k)).numpy(), bias[None], atol=1e-6)
+    weight = np.tile(np.array([65504, -65504, 6e-8, -6e-8], np.float16), (4, 64))
+    linear = Linear(256, 4, bias=False)
+    linear.weight = Tensor(weight)
+    x = np.tile(np.array([1, -1, 1e-3, -1e-3], np.float32), (1, 64))
+    np.testing.assert_allclose(linear(Tensor(x)).numpy(), x @ weight.astype(np.float32).T, rtol=1e-6)
+
+  def test_unsupported_shapes_fall_back(self):
+    # in_features not a multiple of 1024, out_features not of 4, a view that is not 16-byte aligned
+    for typ, (k, n), offset in ((12, (512, 4), 0), (14, (1024, 6), 0), (12, (1024, 8), 4), (14, (1024, 8), 2)):
+      linear = Linear(k, n, bias=False)
+      linear.weight = _packed(np.random.default_rng(2), typ, n, k, offset=offset)[1]
+      x = Tensor(np.ones((1, k), np.float32))
+      np.testing.assert_allclose(linear(x).numpy(), (x @ linear.weight.T).numpy(), rtol=1e-5)
+      self.assertIsNone(linear.ggml_type)
 
 if __name__ == "__main__": unittest.main()
