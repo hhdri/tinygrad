@@ -180,7 +180,12 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
   # Q4_K groups (32) match m16n8k32; Q6_K scales every 16 weights, so it uses m16n8k16.
   q4 = ggml_type == Q4_K
   group_size, words = (32, 36) if q4 else (16, 105)
-  groups = 64//group_size
+  # weights per row per stage: 128-weight stages halve the barriers per K and their 90 KB need dynamic shared memory. Measured on an
+  # RTX 4060 at 512 tokens, they speed up Q4_K with out_features <= in_features (attention 4096x4096 -7%, FFN down -6%) but slow
+  # the wide gate/up shapes (+5%) and Q6_K (+11%)
+  SK = 128 if q4 and out_features <= in_features else 64
+  parts, g64 = SK//64, 64//group_size  # 64-weight parts per stage, groups per part
+  groups = SK//group_size
   # Q6_K's k16 fragments and per-16 coefficients need more registers per MMA; with a long K (e.g. FFN down, 12288 -> 4096) 32 rows
   # per warp leave room to hide latency (10% faster there), while short-K shapes keep the larger tile
   narrow = not q4 and in_features > out_features
@@ -201,18 +206,23 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
   # 20-word rows: the fragment reads of 8 rows x 4 words fall in distinct banks, and 16-byte stores stay aligned
   # double buffered: iteration s computes from buffer s%2 while it stages s+1 into the other one; the barrier that ends each
   # iteration orders both the stores before the next iteration's reads and the reads before the stores that overwrite them
-  w_s = UOp.alloc((2, TN, 20), dtypes.uint32, addrspace=AddrSpace.LOCAL)
-  x_s = UOp.alloc((2, TM, 20), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  w_s = UOp.alloc((2, TN, SK//4+4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  x_s = UOp.alloc((2, TM, SK//4+4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
   # Q4_K: (scale*d, min*dmin) per row and (d, -(sum of quants)*d) per token; Q6_K: scale*d and d
   c_s = UOp.alloc((2, groups, TN, 2 if q4 else 1), dtypes.float32, addrspace=AddrSpace.LOCAL)
   t_s = UOp.alloc((2, groups, TM, 2 if q4 else 1), dtypes.float32, addrspace=AddrSpace.LOCAL)
   acc = UOp.alloc((row_tiles*token_tiles*4,), dtypes.float32, addrspace=AddrSpace.REG)
   acc = acc.after(acc.store(acc.const_like(0)))
-  stages = in_features//64
+  stages = in_features//SK
 
   def stage_stores(stage:UOp, buf:UOp|int) -> list[UOp]:
-    sb, part = stage//4, stage%4
     stores:list[UOp] = []
+    for p in range(parts): stage_part(stage*parts+p, p, buf, stores)
+    return stores
+
+  def stage_part(part64:UOp, p:int, buf:UOp|int, stores:list[UOp]) -> None:
+    # one 64-weight part: words p*16.. and groups p*g64.. of the stage
+    sb, part = part64//4, part64%4
     def coop(n:int, fn) -> None:
       # spread n items over the block's threads; a partial last round masks its stores
       for i in range((n+threads-1)//threads):
@@ -225,7 +235,7 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
       def weights(i, v):
         r, quarter = i//2, i%2
         qs = _vload(raw, row_base(r)+4+part*8+quarter*4, 4)
-        return [w_s[buf, masked(r, v), h*8+quarter*4+k].store((qs[k] >> (h*4)) & 0x0f0f0f0f) for h in range(2) for k in range(4)]
+        return [w_s[buf, masked(r, v), p*16+h*8+quarter*4+k].store((qs[k] >> (h*4)) & 0x0f0f0f0f) for h in range(2) for k in range(4)]
       coop(TN*2, weights)
       def coefficients(i, v):
         sub, r = i//TN, i%TN
@@ -233,9 +243,9 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
         a, b, c = ((x >> (((part*2+sub)%4)*8).cast(dtypes.uint32)) & 255 for x in (s0, s1, s2))
         low = part < 2
         scale, minimum = low.where(a & 63, (c & 15) | ((a >> 6) << 4)), low.where(b & 63, (c >> 4) | ((b >> 6) << 4))
-        return [c_s[buf, sub, masked(r, v), 0].store(_half(head & 0xffff)*scale.float()),
-                c_s[buf, sub, masked(r, v), 1].store(_half(head >> 16)*minimum.float())]
-      coop(TN*groups, coefficients)
+        return [c_s[buf, p*g64+sub, masked(r, v), 0].store(_half(head & 0xffff)*scale.float()),
+                c_s[buf, p*g64+sub, masked(r, v), 1].store(_half(head >> 16)*minimum.float())]
+      coop(TN*g64, coefficients)
     else:
       def weights(i, v):
         r, w = i//16, i%16
@@ -243,28 +253,27 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
         ql, qh = _u32(raw, row_base(r)+(n*64+(q%2)*32+l)//2), _u32(raw, row_base(r)+64+(n*32+l)//2)
         word = ((ql >> ((q//2)*4).cast(dtypes.uint32)) & 0x0f0f0f0f) | (((qh >> (q*2).cast(dtypes.uint32)) & 0x03030303) << 4)
         # bytewise q-32 without borrows: clearing bit 5 subtracts 32 from q >= 32, q < 32 also gets the sign bits 0xc0
-        return [w_s[buf, masked(r, v), w].store((word ^ 0x20202020) | (((word ^ 0xffffffff) & 0x20202020) * 6))]
+        return [w_s[buf, masked(r, v), p*16+w].store((word ^ 0x20202020) | (((word ^ 0xffffffff) & 0x20202020) * 6))]
       coop(TN*16, weights)
       def coefficients(i, v):
         sub, r = i//TN, i%TN
         s16 = part*4+sub
         scale = (raw[row_base(r)+96+s16//2].load() >> ((s16%2)*8).cast(dtypes.uint16)).cast(dtypes.uint8).bitcast(dtypes.int8).float()
-        return [c_s[buf, sub, masked(r, v), 0].store(_half(raw[row_base(r)+104].load())*scale)]
-      coop(TN*groups, coefficients)
+        return [c_s[buf, p*g64+sub, masked(r, v), 0].store(_half(raw[row_base(r)+104].load())*scale)]
+      coop(TN*g64, coefficients)
     def activations(i, v):
       tk, quarter = i//4, i%4
-      x = _vload(xq, (tok0+tk)*(in_features//4)+stage*16+quarter*4, 4)
-      return [x_s[buf, masked(tk, v), quarter*4+k].store(x[k]) for k in range(4)]
+      x = _vload(xq, (tok0+tk)*(in_features//4)+part64*16+quarter*4, 4)
+      return [x_s[buf, masked(tk, v), p*16+quarter*4+k].store(x[k]) for k in range(4)]
     coop(TM*4, activations)
     def token_terms(i, v):
       sub, tk = i//TM, i%TM
-      tok, grp = tok0+tk, stage*groups+sub
-      if not q4: return [t_s[buf, sub, masked(tk, v), 0].store(xd[tok, grp//2].load())]
+      tok, grp = tok0+tk, part64*g64+sub
+      if not q4: return [t_s[buf, p*g64+sub, masked(tk, v), 0].store(xd[tok, grp//2].load())]
       d = xd[tok, grp].load()
       total = xs[tok, grp*2].load()+xs[tok, grp*2+1].load()
-      return [t_s[buf, sub, masked(tk, v), 0].store(d), t_s[buf, sub, masked(tk, v), 1].store(-total*d)]
-    coop(TM*groups, token_terms)
-    return stores
+      return [t_s[buf, p*g64+sub, masked(tk, v), 0].store(d), t_s[buf, p*g64+sub, masked(tk, v), 1].store(-total*d)]
+    coop(TM*g64, token_terms)
 
   prologue = stage_stores(UOp.const(0, dtypes.weakint), 0)
   stage = UOp.range(stages, 3, AxisType.LOOP)
