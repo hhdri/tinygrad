@@ -54,8 +54,7 @@ def _tile(n:int, *sizes:int) -> int: return next(s for s in sizes if n % s == 0)
 # ******** q8 activations ********
 
 @functools.cache
-def _q8_quantize_kernel(xq:UOp, xd:UOp, xs:UOp, x:UOp, *up:UOp, tokens:int, in_features:int, live:UOp|None=None,
-                        group_major:bool=True) -> UOp:
+def _q8_quantize_kernel(xq:UOp, xd:UOp, xs:UOp, x:UOp, tokens:int, in_features:int, live:UOp|None=None, group_major:bool=True) -> UOp:
   # each lane loads four consecutive values and owns one packed word: a warp covers four groups of 32, the group maximum
   # reduces over 8 lanes and the per-16 sums over 4. Several warps per block keep the occupancy up.
   chunks = in_features//128
@@ -67,8 +66,6 @@ def _q8_quantize_kernel(xq:UOp, xd:UOp, xs:UOp, x:UOp, *up:UOp, tokens:int, in_f
   token_chunk = block*warps + warp
   token, chunk = token_chunk//chunks, token_chunk%chunks
   values = [v.float() for v in _vload(x, token*in_features + chunk*128 + lane*4, 4)]
-  # with up, x is a SwiGLU gate: quantize silu(x)*up
-  if up: values = [v.silu()*u.float() for v, u in zip(values, _vload(up[0], token*in_features + chunk*128 + lane*4, 4))]
   amax = functools.reduce(UOp.maximum, (v.abs() for v in values))
   # keep the division: reciprocal multiplication can move values across rounding ties
   d = _custom("({0}/127.0f)", dtypes.float, warp_reduce(amax, maximum=True, width=8)).maximum(1e-30)
@@ -81,18 +78,13 @@ def _q8_quantize_kernel(xq:UOp, xd:UOp, xs:UOp, x:UOp, *up:UOp, tokens:int, in_f
             at(xs, group*2 + (w//4).valid((w%4).eq(0))).store(warp_reduce(sum(quants[1:], quants[0]), width=4)))
   return UOp.group(*stores).end(block, lane, warp).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
-def q8_quantize(x:Tensor, tokens:int, in_features:int, cache:dict|None=None, up:Tensor|None=None,
-                live:UOp|None=None, group_major:bool=True) -> tuple[Tensor, Tensor, Tensor]:
-  # cache: shared by projections of the same input (Linear.project), which then quantize it once
-  # up: x is a SwiGLU gate, the quantized input is silu(x)*up (never written out)
-  if cache is not None and up is None and (hit:=cache.get((tokens, in_features, group_major))) is not None: return hit
+def q8_quantize(x:Tensor, tokens:int, in_features:int, live:UOp|None=None, group_major:bool=True) -> tuple[Tensor, Tensor, Tensor]:
   xq = Tensor.empty(tokens, in_features//4, dtype=dtypes.uint32, device=x.device)
   xd = Tensor.empty(*((in_features//32, tokens) if group_major else (tokens, in_features//32)), dtype=dtypes.float32, device=x.device)
   xs = Tensor.empty(*((in_features//16, tokens) if group_major else (tokens, in_features//16)), dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features, live=live, group_major=group_major)
   if live is not None: xq = Tensor(xq.uop.after(live))  # carries the live-token binding into the kernel
-  xq, xd, xs = Tensor.custom_kernel(xq, xd, xs, x.contiguous(), *(() if up is None else (up.contiguous(),)), fxn=fxn)[:3]
-  if cache is not None and up is None: cache[(tokens, in_features, group_major)] = (xq, xd, xs)
+  xq, xd, xs = Tensor.custom_kernel(xq, xd, xs, x.contiguous(), fxn=fxn)[:3]
   return xq, xd, xs
 
 # ******** decode: dp4a gemv ********
@@ -151,16 +143,17 @@ def _q6k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_f
     return _half(raw[base + 104].load()) * (sclo*(dlo.float() - 32*xslo)*xdlo + schi*(dhi.float() - 32*xshi)*xdhi)
   return _gemv(out, tokens, out_features, in_features, lane_dot, "q6k_gemv")
 
-def nv_linear_supported(ggml_type:int|None, in_features:int, out_features:int) -> bool:
-  return ggml_type in NV_QUANTS and in_features % 1024 == 0 and out_features % ROWS_PER_BLOCK == 0
+def nv_linear_supported(ggml_type:int|None, in_features:int, out_features:int, offset:int=0) -> bool:
+  # offset: the packed view's byte offset into its buffer. The kernels read super-blocks with 16-byte loads and cp.async copies, so
+  # the view must be 16-byte aligned (GGUF tensor data is 32-byte aligned)
+  return ggml_type in NV_QUANTS and offset % 16 == 0 and in_features % 1024 == 0 and out_features % ROWS_PER_BLOCK == 0
 
-def nv_q8_linear(weight:Tensor, ggml_type:int, x:Tensor, in_features:int, out_features:int, q8:dict|None=None,
-                 up:Tensor|None=None) -> Tensor:
+def nv_q8_linear(weight:Tensor, ggml_type:int, x:Tensor, in_features:int, out_features:int) -> Tensor:
   tokens = int(x.numel()) // in_features
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_q4k_gemv_kernel if ggml_type == Q4_K else _q6k_gemv_kernel, tokens=tokens, out_features=out_features,
                           in_features=in_features)
-  return Tensor.custom_kernel(out, weight, *q8_quantize(x, tokens, in_features, q8, up), fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
+  return Tensor.custom_kernel(out, weight, *q8_quantize(x, tokens, in_features), fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
 
 # ******** dense decode ********
 
@@ -193,11 +186,8 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
   # Q4_K groups (32) match m16n8k32; Q6_K scales every 16 weights, so it uses m16n8k16.
   q4 = ggml_type == Q4_K
   group_size, words = (32, 36) if q4 else (16, 105)
-  # weights per row per stage: 128-weight stages halve the barriers per K and their 90 KB need dynamic shared memory. Measured on an
-  # RTX 4060 at 512 tokens, they speed up Q4_K with out_features <= in_features (attention 4096x4096 -7%, FFN down -6%) but slow
-  # the wide gate/up shapes (+5%) and Q6_K (+11%)
-  SK = 128 if q4 and out_features <= in_features else 64
-  parts, g64 = SK//64, 64//group_size  # 64-weight parts per stage, groups per part
+  SK = 64  # weights per row per stage
+  parts, g64 = 1, 64//group_size  # 64-weight parts per stage, groups per part
   groups = SK//group_size
   # Q6_K's k16 fragments and per-16 coefficients need more registers per MMA; with a long K (e.g. FFN down, 12288 -> 4096) 32 rows
   # per warp leave room to hide latency (10% faster there), while short-K shapes keep the larger tile
@@ -554,21 +544,19 @@ def _q4k_mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_fe
           for mt in range(MT) for nt in range(NT) for i in range(4)]
   return UOp.group(*outs).end(token_block, row_block, lane, warp).sink(arg=KernelInfo(name="q4k_mmq", opts_to_apply=(), min_blocks=2))
 
-def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type:int, live:UOp|None=None, q8:dict|None=None,
-           up:Tensor|None=None) -> Tensor:
+def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type:int, live:UOp|None=None) -> Tensor:
   # live: the symbolic token count of a chunk padded to its max size; the rows past it are left unwritten
   shape = x.shape[:-1]
   tokens = int(x.numel())//in_features
   padded_tokens = (tokens+7)//8*8
   x = x.reshape(tokens, in_features).pad(((0, padded_tokens-tokens), (0, 0)))
-  if up is not None: up = up.reshape(tokens, in_features).pad(((0, padded_tokens-tokens), (0, 0)))
   out = Tensor.empty(padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
   # Q6_K stages raw super-blocks with cp.async where its 64x128 tile divides the shape (two blocks per SM); other shapes share the
   # register-staged kernel with Q4_K
   v2 = ggml_type == Q6_K and out_features % 64 == 0 and padded_tokens % 128 == 0
   fxn = functools.partial(_q6k_mmq_kernel, tokens=padded_tokens, out_features=out_features, in_features=in_features, live=live) if v2 else \
         functools.partial(_mmq_kernel, tokens=padded_tokens, out_features=out_features, in_features=in_features, ggml_type=ggml_type, live=live)
-  xq, xd, xs = q8_quantize(x, padded_tokens, in_features, q8, up, live, group_major=ggml_type == Q4_K or v2)
+  xq, xd, xs = q8_quantize(x, padded_tokens, in_features, live, group_major=ggml_type == Q4_K or v2)
   if live is not None: xq = Tensor(xq.uop.after(live))
   # a padded symbolic chunk whose live tokens end in a 1-64 token tail can run a 64-token-block cp.async kernel instead (no nearly empty
   # 128-token block): 128 rows per block for Q4_K (4 row x 2 token warps: 1.5% faster than 2 x 4 here), 64 for Q6_K, whose raw tile is

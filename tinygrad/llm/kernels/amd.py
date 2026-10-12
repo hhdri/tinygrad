@@ -61,15 +61,11 @@ def _pad_to_max(t:Tensor) -> Tensor:
   if (u:=t.uop).op is Ops.SHRINK and u.src[0].shape == t.max_shape and u.src[0].base.has_buffer_identity(after_ok=True): return Tensor(u.src[0])
   return pad_unwritten(t, t.max_shape)
 
-def silu_gate(gate:Tensor) -> Tensor:
-  # TODO: remove the need for this contiguous. A lazy gate matmul needs its own kernel (fused into the up/down product it is much
-  # slower); a gate that is already a buffer (custom kernel output) is cheaper fused into its consumer
-  return gate.silu() if gate.uop.base.has_buffer_identity(after_ok=True) else gate.silu().contiguous()
-
 # ******** quant linear: q8-activation kernels over packed ggml weights ********
 
 class Linear(nn.Linear):
   ggml_type:int|None = None
+  raw_offset = 0  # byte offset of the packed view into the GGUF storage
   use_custom_quant = True
   shard_axis:int|None = None
   def __init__(self, in_features:int, out_features:int, bias=True):
@@ -100,22 +96,11 @@ class Linear(nn.Linear):
     word_dtype = dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32
     raw_offset = raw.contiguous_view_offset()
     if raw_offset is None or raw_offset % word_dtype.itemsize or raw.buf_uop.dtype != dtypes.uint8: return
-    self.ggml_type = ggml_type
+    self.ggml_type, self.raw_offset = ggml_type, raw_offset
     self.shard_axis = decoded.uop.axis
     self.weight = Tensor(raw).flatten().bitcast(word_dtype).contiguous()
-  @staticmethod
-  def project(x:Tensor, *layers:nn.Linear) -> list[Tensor]:
-    # projections of one input: on NVIDIA its q8 quantization is shared, so it runs once
-    q8:dict = {}
-    return [l(x, q8) if isinstance(l, Linear) else l(x) for l in layers]
-
-  def swiglu(self, gate:Tensor, up:Tensor) -> Tensor:
-    # projects silu(gate)*up; NVIDIA's packed kernels form the product while quantizing it, so it is never written out
-    if self.use_custom_quant and nv_custom_kernels_supported(self.weight.device): return self._nv_call(gate, up=up)
-    return self(silu_gate(gate) * up)
-
-  def __call__(self, x:Tensor, q8:dict|None=None) -> Tensor:
-    if self.use_custom_quant and nv_custom_kernels_supported(self.weight.device): return self._nv_call(x, q8)
+  def __call__(self, x:Tensor) -> Tensor:
+    if self.use_custom_quant and nv_custom_kernels_supported(self.weight.device): return self._nv_call(x)
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
@@ -136,7 +121,7 @@ class Linear(nn.Linear):
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return super().__call__(x)
 
-  def _nv_call(self, x:Tensor, q8:dict|None=None, up:Tensor|None=None) -> Tensor:
+  def _nv_call(self, x:Tensor) -> Tensor:
     if self.ggml_type is None:
       # keep the lazy dequantization for the shapes the packed kernels don't cover
       self.dense = self.weight
@@ -145,28 +130,25 @@ class Linear(nn.Linear):
       if self.ggml_type is None and (weight:=_view_back(self.weight)).dtype == dtypes.float16 and weight.uop.contiguous_view() is not None \
         and self.weight.uop.axis is None \
         and self.in_features % 256 == 0 and self.out_features % 4 == 0:
-        # only the packed q8 kernels fuse the SwiGLU product
-        if up is not None: x, up = silu_gate(x) * up, None
         if isinstance(numel:=x.numel(), int) and numel == self.in_features:
           out = nv_f16_gemv(weight, x, self.in_features, self.out_features)
         # prefill: F16 activations with F32 accumulation run on tensor cores; F32 activations would promote the weight to F32.
         # contiguous() turns the uint8 GGUF view into a zero-copy F16 buffer view: through the bitcast the matmul loaded bytes.
         else: out = x.cast(dtypes.float16).matmul(weight.contiguous().T, dtype=dtypes.float32)
         return out if self.bias is None else out + self.bias
-      if not nv_linear_supported(self.ggml_type, self.in_features, self.out_features):
+      if not nv_linear_supported(self.ggml_type, self.in_features, self.out_features, self.raw_offset):
         self.use_custom_quant, self.weight, self.ggml_type = False, self.dense, None
-        return super().__call__(x if up is None else silu_gate(x) * up)
+        return super().__call__(x)
     assert self.ggml_type is not None
     numel = x.numel()
     if prod(x.max_shape) > self.in_features and self.out_features % 16 == 0 and nv_mmq_supported(self.weight.device):
       out = nv_mmq(self.weight, x if isinstance(numel, int) else _pad_to_max(x),
-                   self.in_features, self.out_features, self.ggml_type, None if isinstance(numel, int) else numel//self.in_features, q8,
-                   up if up is None or isinstance(numel, int) else _pad_to_max(up))
+                   self.in_features, self.out_features, self.ggml_type, None if isinstance(numel, int) else numel//self.in_features)
       if not isinstance(numel, int): out = out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
       return out if self.bias is None else out + self.bias
     if not isinstance(numel, int) or numel != self.in_features:
-      return (x if up is None else silu_gate(x) * up).linear(self.dense.T, self.bias)
-    out = nv_q8_linear(self.weight, self.ggml_type, x, self.in_features, self.out_features, q8, up)
+      return x.linear(self.dense.T, self.bias)
+    out = nv_q8_linear(self.weight, self.ggml_type, x, self.in_features, self.out_features)
     return out if self.bias is None else out + self.bias
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
