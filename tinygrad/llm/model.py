@@ -117,6 +117,11 @@ def _silu_gate(gate:Tensor) -> Tensor:
   # slower); a gate that is already a buffer (custom kernel output) is cheaper fused into its consumer
   return gate.silu() if gate.uop.base.has_buffer_identity(after_ok=True) else gate.silu().contiguous()
 
+def _own_kernel(x:Tensor) -> Tensor:
+  # TODO: remove the need for this contiguous. A lazy matmul fused into a consumer that doesn't need all of it (the stacked KV cache
+  # store) is much slower; a tensor that is already a buffer (custom kernel output) is cheaper fused
+  return x if x.uop.base.has_buffer_identity(after_ok=True) else x.contiguous()
+
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
     self.config = config
@@ -204,6 +209,8 @@ class TransformerBlock(FFNBlock):
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+    # v gets its own kernel: fused into the stacked KV cache store, the k half of the store would also run the v matmul
+    v = _own_kernel(v)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
