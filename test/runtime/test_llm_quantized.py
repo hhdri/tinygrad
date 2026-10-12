@@ -144,8 +144,9 @@ class TestNVQuantLinear(unittest.TestCase):
     if int(Device[Device.DEFAULT].renderer.target.arch[3:]) < 80: self.skipTest("SM80 required")
     rng = np.random.default_rng(11)
     for typ in (12,14):
-      # 256 padded tokens span two 128-token blocks: 3 and 16 live tokens launch only the first, 130 both
-      for tokens in (3,16,130):
+      # 256 padded tokens span two 128-token blocks: 3 and 16 live tokens launch only the first, 130 and 200 both; Q4_K runs live
+      # counts ending in a 1-64 token tail (3, 16, 130) on its 64-token-block kernel and the others (100, 200) on the shared one
+      for tokens in (3,16,100,130,200):
         with self.subTest(typ=typ, tokens=tokens):
           packed = rng.integers(0,256,(16*1024//256,QUANT_SIZES[typ]),dtype=np.uint8)
           if typ == 12: packed[:,:4] = np.array([.001,.0002],np.float16).view(np.uint8)
