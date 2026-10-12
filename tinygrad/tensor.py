@@ -20,7 +20,10 @@ def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str) -> None:
     # get tensors in scope
     in_scope: dict[UOp, bool] = {}
     def visitor(node: UOp) -> bool: return True if node in applied_map else any(in_scope.get(s, False) for s in node.src)
-    scope_tensors: list[Tensor] = [t for tref in list(all_tensors) if (t:=tref()) is not None and t.uop.topovisit(visitor, in_scope)]
+    # a graph only holds UOps created before its root: a tensor whose UOp is older than all the mapped ones is out of scope unwalked
+    oldest = min((u.created for u in applied_map), default=0)
+    scope_tensors: list[Tensor] = [t for tref in list(all_tensors) if (t:=tref()) is not None and t.uop.created >= oldest and
+                                   t.uop.topovisit(visitor, in_scope)]
 
     # get all Tensors and apply the map. always walk: replace exactly the nodes the map names, values are final
     sink = UOp.sink(*[t.uop for t in scope_tensors])
