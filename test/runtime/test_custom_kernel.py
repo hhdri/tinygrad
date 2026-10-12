@@ -7,7 +7,7 @@ from tinygrad.schedule.rangeify import BufferizeOpts
 from tinygrad.uop.ops import KernelInfo, AxisType, Ops, uopfunc
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.renderer.ptx import PTXRenderer
-from tinygrad.renderer.cstyle import CStyleLanguage
+from tinygrad.renderer.cstyle import CStyleLanguage, CUDARenderer
 from tinygrad.renderer.llvmir import LLVMRenderer
 from test.helpers import assert_kernel_count
 from test.null.test_custom_kernel import custom_elementwise_add_kernel, custom_elementwise_addmul_kernel, custom_gemm
@@ -230,6 +230,23 @@ class TestCustomKernel(unittest.TestCase):
       return C[i].store(B[i, g1, g2].reduce(g2, arg=Ops.ADD).reduce(g1, arg=Ops.ADD)).end(i).sink(arg=KernelInfo(opts_to_apply=()))
     b = Tensor.arange(128).reshape(4, 4, 8).float().contiguous().realize()
     self.assertEqual(Tensor.custom_kernel(Tensor.empty(4), b, fxn=kernel)[0].tolist(), b.sum((1, 2)).tolist())
+
+  @unittest.skipUnless(isinstance(Device[Device.DEFAULT].renderer, CUDARenderer) and
+                       int(Device[Device.DEFAULT].renderer.target.arch[3:] or 0) >= 70, "shared memory above 48 KB")
+  def test_large_shared_memory(self):
+    # LOCAL buffers above the 48 KB static limit live in dynamic shared memory; two 32 KB buffers also check their offsets
+    N = 8192
+    def kernel(C:UOp, A:UOp) -> UOp:
+      blk, tid = UOp.range(2, 0, AxisType.GLOBAL), UOp.range(256, 1, AxisType.LOCAL)
+      a_s, b_s = (UOp.alloc((N,), dtypes.float32, addrspace=AddrSpace.LOCAL) for _ in range(2))
+      stores = [st for i in range(N//256) for st in (a_s[tid+i*256].store(A[blk*N+tid+i*256]), b_s[tid+i*256].store(A[blk*N+tid+i*256]*3))]
+      barrier = UOp.group(*stores).barrier()
+      a_s, b_s = a_s.after(barrier), b_s.after(barrier)
+      outs = [C[blk*N+tid+i*256].store(a_s[N-1-(tid+i*256)] + b_s[tid+i*256]) for i in range(N//256)]
+      return UOp.group(*outs).end(blk, tid).sink(arg=KernelInfo(name="large_shared", opts_to_apply=()))
+    a = np.random.default_rng(0).normal(size=(2, N)).astype(np.float32)
+    out = Tensor.custom_kernel(Tensor.empty(2*N), Tensor(a.ravel()).realize(), fxn=kernel)[0].numpy().reshape(2, N)
+    np.testing.assert_allclose(out, a[:, ::-1] + a*3, rtol=1e-6)
 
   @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "test requires locals")
   def test_local_reduce(self):
