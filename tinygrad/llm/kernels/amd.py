@@ -8,6 +8,7 @@ from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
 from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv, nv_mmq, nv_mmq_supported
+from tinygrad.llm.kernels.nv import warp_reduce as nv_warp_reduce
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -543,7 +544,7 @@ def _vec_load(ptr:UOp, lanes:int) -> tuple[UOp, ...]:
   return tuple(vec[i].float() for i in range(lanes))
 
 @functools.cache
-def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4):
+def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4, nv=False):
   valid_kv_len = _unbind(valid_kv_len)
   _, B, H_KV, N, D = cast(tuple[int, int, int, int, int], cache_kv.shape)
   _, H, M, _ = cast(tuple[int, int, int, int], q.shape)
@@ -573,7 +574,8 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
     # V is prefetched in the score pass so both streams are in flight together
     vfrags[j] = tuple(valid.where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
     for h in range(G):
-      s = warp_reduce(sum((qf[h][i]*kfrag[i] for i in range(DPL)), UOp.const(0, dtypes.float)), full_wave=True) * (1/math.sqrt(D))
+      dot = sum((qf[h][i]*kfrag[i] for i in range(DPL)), UOp.const(0, dtypes.float))
+      s = (nv_warp_reduce(dot) if nv else warp_reduce(dot, full_wave=True)) * (1/math.sqrt(D))
       scores[j][h] = valid.where(s, UOp.const(-1e30, dtypes.float))
   # A finite initial max keeps fully masked waves from computing exp(-inf - -inf).
   acc_reg, max_reg, sum_reg = _reg((G, DPL), 0), _reg((G,), -1e30), _reg((G,), 0)
@@ -654,15 +656,18 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   # Carry length bindings even when the cache was populated independently of this call.
   if isinstance(valid_kv_len, UOp): cache_kv = Tensor(cache_kv.uop.after(valid_kv_len))
   B, H, D = cache_kv.shape[1], q.shape[1], cache_kv.shape[4]
-  chunks, axis = min(48, max_kv_len // 64), q.uop.axis
+  # NVIDIA: smaller chunks and blocks spread a short context over more of the SMs (RTX 4060, 560-token context: 622 -> 524 us/token)
+  nv = nv_custom_kernels_supported(q.device)
+  block_n, waves, group = 32 if nv else 64, 8 if nv else 16, H // cache_kv.shape[2]
+  chunks, axis = min(64 if nv else 48, max_kv_len // block_n), q.uop.axis
   partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device, axis=axis)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device, axis=axis)
-  waves, group = 16, H // cache_kv.shape[2]
-  while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
+  while waves * group * ((D+LDS_PAD)*2 + 8) > (49152 if nv else 65536): waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
-  fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=64, waves=waves)
+  fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=block_n,
+                          waves=waves, nv=nv)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
-  live = (valid_kv_len+63)//64
+  live = (valid_kv_len+block_n-1)//block_n
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)
   out = Tensor.empty(B, H, 1, D, dtype="float32", device=q.device, axis=axis)
   fxn = functools.partial(_amd_flash_decode_combine, live=live)
