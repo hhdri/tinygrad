@@ -8,7 +8,7 @@ from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
 from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv, nv_mmq, nv_mmq_supported, \
-  pad_to_max
+  pad_to_max, nv_f16_gemm, nv_f16_gemm_supported
 from tinygrad.llm.kernels.nv import warp_reduce as nv_warp_reduce
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
@@ -150,6 +150,10 @@ class Linear(nn.Linear):
         if up is not None: x, up = silu_gate(x) * up, None
         if isinstance(numel:=x.numel(), int) and numel == self.in_features:
           out = nv_f16_gemv(weight, x, self.in_features, self.out_features)
+        # prefill of a padded symbolic chunk: the NV F16 GEMM over its live token blocks
+        elif not isinstance(numel, int) and nv_f16_gemm_supported(weight, x, self.in_features, self.out_features):
+          out = nv_f16_gemm(weight, pad_to_max(x.cast(dtypes.float16)), self.in_features, self.out_features, numel//self.in_features)
+          out = out.reshape(*x.max_shape[:-1], self.out_features).shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
         # prefill: F16 activations with F32 accumulation run on tensor cores; F32 activations would promote the weight to F32.
         # contiguous() turns the uint8 GGUF view into a zero-copy F16 buffer view: through the bitcast the matmul loaded bytes.
         else: out = x.cast(dtypes.float16).matmul(weight.contiguous().T, dtype=dtypes.float32)

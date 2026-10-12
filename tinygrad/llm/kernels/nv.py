@@ -186,6 +186,81 @@ def nv_f16_gemv(weight:Tensor, x:Tensor, in_features:int, out_features:int) -> T
   fxn = functools.partial(_f16_gemv_kernel, in_features=in_features, out_features=out_features)
   return Tensor.custom_kernel(out, weight.contiguous(), x.contiguous(), fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
 
+# ******** prefill: dense F16 weights ********
+
+GEMM_TN, GEMM_TM, GEMM_TK = 64, 64, 64
+
+@functools.cache
+def _f16_gemm_kernel(out:UOp, w:UOp, x:UOp, tokens:int, out_features:int, in_features:int, live:UOp|None=None) -> UOp:
+  # out[t, n] = sum_k x[t, k] w[n, k] on m16n8k16 half MMAs with float accumulation. A block owns 64 rows x 64 tokens, 4 warps of
+  # 32 x 32; K goes in 64-half stages through two shared buffers: the next stage's cp.async copies are issued before this stage's
+  # MMAs (16-byte chunks XOR-swizzled by row, ldmatrix fragments). A padded symbolic chunk launches its live token blocks only.
+  TN, TM, TK, threads = GEMM_TN, GEMM_TM, GEMM_TK, 128
+  n = None if live is None else live.unbind_all()[0]
+  token_block = UOp.range(tokens//TM if n is None else (n+TM-1)//TM, 1, AxisType.GLOBAL)
+  row_block, lane, warp = UOp.range(out_features//TN, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP), UOp.range(4, 2, AxisType.LOCAL)
+  tid, g, t = warp*32 + lane, lane//4, lane%4
+  row0, tok0, wr, tc = row_block*TN, token_block*TM, (warp//2)*32, (warp%2)*32
+  words, chunks, stages = TK//2, TK//8, in_features//TK
+  bufs = [(UOp.alloc((TN, words), dtypes.uint32, addrspace=AddrSpace.LOCAL), UOp.alloc((TM, words), dtypes.uint32, addrspace=AddrSpace.LOCAL))
+          for _ in range(2)]
+  def swz(r:UOp, c:UOp) -> UOp: return r*words + (c ^ (r%8))*4
+  def copies(stage:UOp, ws:UOp, xs:UOp) -> list[UOp]:
+    ops = []
+    for i in range((TN+TM)*chunks//threads):
+      idx = tid + i*threads
+      r, c = idx//chunks % TN, idx%chunks
+      dst, src, base = (ws, w, row0) if i < TN*chunks//threads else (xs, x, tok0)
+      ops.append(_cp_async(dst.flatten()[swz(r, c)], src.flatten()[(base+r)*in_features + stage*TK + c*8], UOp.const(16, dtypes.int)))
+    return ops
+  def compute(ws:UOp, xs:UOp, cur:UOp, axis:int, pre:list[UOp]) -> UOp:
+    # pre: the next stage's copies, issued before this loop (which waits on them through the AFTER)
+    ks = UOp.range(TK//16, axis, AxisType.LOOP)
+    c = cur.after(ks, *pre)
+    vals = [c[i].load() for i in range(32)]
+    af = [_ldm(ws, swz(wr + mt*16 + lane%8 + (lane//8%2)*8, ks*2 + lane//16), 4) for mt in range(2)]
+    bf = [_ldm(xs, swz(tc + np_*16 + lane%8 + (lane//16)*8, ks*2 + lane//8%2), 4) for np_ in range(2)]
+    for nt in range(4):
+      b = UOp.stack(bf[nt//2][(nt%2)*2], bf[nt//2][(nt%2)*2+1]).bitcast(dtypes.half)
+      for mt in range(2):
+        o = (mt*4+nt)*4
+        res = UOp.wmma(UOp.stack(*(af[mt][j] for j in range(4))).bitcast(dtypes.half), b, UOp.stack(*vals[o:o+4]), (8,16,16), 32)
+        vals[o:o+4] = [res[i] for i in range(4)]
+    return cur.after(c.store(UOp.stack(*vals)).end(ks))
+  acc = UOp.alloc((32,), dtypes.float32, addrspace=AddrSpace.REG)
+  acc = acc.after(acc.store(acc.const_like(0)))
+  zero = UOp.const(0, dtypes.weakint)
+  b0 = _cp_wait(*copies(zero, *bufs[0])).barrier()
+  it = UOp.range(stages//2, 3, AxisType.LOOP)
+  (w0, x0), (w1, x1) = [(a.after(b0, it), b.after(b0, it)) for a, b in bufs]
+  cur = acc.after(it)
+  # stage 2it from buffer 0 while stage 2it+1 copies into buffer 1, then the reverse (the last copy re-reads stage 0, never used)
+  c1 = copies(it*2+1, w1, x1)
+  st0 = compute(w0, x0, cur, 10, c1)
+  b1 = _cp_wait(*c1, st0[0].load()).barrier()
+  w0b, x0b, w1b, x1b = (u.after(b1) for u in (w0, x0, w1, x1))
+  c2 = copies(((it+1)*2) % stages, w0b, x0b)
+  st1 = compute(w1b, x1b, st0.after(b1), 11, c2)
+  b2 = _cp_wait(*c2, st1[0].load()).barrier()
+  acc = acc.after(b2.end(it))
+  def orow(tk:UOp) -> UOp: return tk if n is None else tk.valid(tk < tokens)
+  outs = [out[orow(tok0+tc+nt*8+2*t+i%2), row0+wr+mt*16+g+(i//2)*8].store(acc[(mt*4+nt)*4+i].load())
+          for mt in range(2) for nt in range(4) for i in range(4)]
+  return UOp.group(*outs).end(token_block, row_block, lane, warp).sink(arg=KernelInfo(name="f16_gemm", opts_to_apply=()))
+
+def nv_f16_gemm_supported(weight:Tensor, x:Tensor, in_features:int, out_features:int) -> bool:
+  return nv_mmq_supported(weight.device) and in_features % (2*GEMM_TK) == 0 and out_features % GEMM_TN == 0 and \
+    prod(x.max_shape)//in_features % GEMM_TM == 0
+
+def nv_f16_gemm(weight:Tensor, x:Tensor, in_features:int, out_features:int, live:UOp|None=None) -> Tensor:
+  # x: (tokens, in_features) padded to whole 64-token blocks (a symbolic chunk to its max); weight: (out_features, in_features) half
+  tokens = int(x.numel())//in_features
+  out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device)
+  xh = x.reshape(tokens, in_features).cast(dtypes.half).contiguous()  # a half input (e.g. written for its live rows only) passes as is
+  if live is not None: xh = Tensor(xh.uop.after(live))  # carries the live-token binding into the kernel
+  fxn = functools.partial(_f16_gemm_kernel, tokens=tokens, out_features=out_features, in_features=in_features, live=live)
+  return Tensor.custom_kernel(out, weight.contiguous(), xh, fxn=fxn)[0]
+
 # ******** prefill: integer tensor cores ********
 
 @functools.cache
@@ -612,7 +687,7 @@ def _rmsnorm_q8_kernel(xq:UOp, xd:UOp, xs:UOp, *rest:UOp, n_parts:int, dim:int, 
     v = vals[c*4:c*4+4]
     normed = [x*rms*weight[j].load().float() for x, j in zip(v, idx[c*4:c*4+4])]
     if write_sum: stores += [outs[0][token*dim + j].store(x) for x, j in zip(v, idx[c*4:c*4+4])]
-    if write_normed: stores += [outs[-1][token*dim + j].store(x) for x, j in zip(normed, idx[c*4:c*4+4])]
+    if write_normed: stores += [outs[-1][token*dim + j].store(x.cast(outs[-1].dtype)) for x, j in zip(normed, idx[c*4:c*4+4])]
     amax = functools.reduce(UOp.maximum, (x.abs() for x in normed))
     d = _custom("({0}/127.0f)", dtypes.float, warp_reduce(amax, maximum=True, width=8)).maximum(1e-30)
     quants = [_custom("rintf({0}/{1})", dtypes.float, x, d).clip(-127, 127) for x in normed]
@@ -639,7 +714,9 @@ def nv_rmsnorm_q8(parts:list[Tensor], weight:Tensor, eps:float, write_sum:bool=F
   xd = Tensor.empty(dim//32, tokens, dtype=dtypes.float32, device=dev)
   xs = Tensor.empty(dim//16, tokens, dtype=dtypes.float32, device=dev)
   if live is not None: xq = Tensor(xq.uop.after(live))  # carries the live-token binding into the kernel
-  extra = [Tensor.empty(tokens*dim, dtype=dtypes.float32, device=dev) for _ in range(int(write_sum)+int(write_normed))]
+  # the normed input of a prefill chunk is written as half (its consumer, the F16 GEMM, casts to half anyway); decode keeps float
+  extra = [Tensor.empty(tokens*dim, dtype=dtypes.float32, device=dev)] if write_sum else []
+  if write_normed: extra.append(Tensor.empty(tokens*dim, dtype=dtypes.float32 if live is None else dtypes.half, device=dev))
   fxn = functools.partial(_rmsnorm_q8_kernel, n_parts=len(parts), dim=dim, eps=eps, write_sum=write_sum, write_normed=write_normed,
                           tokens=tokens, live=live)
   ins = [(p if live is None else pad_to_max(p)).reshape(tokens*dim).float().contiguous() for p in parts]

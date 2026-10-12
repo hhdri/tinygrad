@@ -3,7 +3,7 @@ import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid, flash_attention
 from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq, nv_flash_attention, nv_mmq_supported, nv_qk_prep, nv_rmsnorm_q8, \
-  nv_flash_decode_q8
+  nv_flash_decode_q8, nv_f16_gemm
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
@@ -238,6 +238,19 @@ class TestNVQuantLinear(unittest.TestCase):
         d = np.repeat(xd.numpy().reshape(-1), 32)
         np.testing.assert_allclose(qv*d, ref, atol=float(d.max())*0.51+1e-6)
         np.testing.assert_allclose(xs.numpy().reshape(-1), qv.reshape(-1, 16).sum(-1))
+
+  def test_f16_gemm(self):
+    # the dense F16 prefill GEMM vs numpy on half-rounded inputs: a static 128-token input and live tokens of a padded 256-token chunk
+    rng = np.random.default_rng(8)
+    K, N, T = 1024, 192, 256
+    w = Tensor(rng.normal(size=(N, K)).astype(np.float16)*0.05).realize()
+    xs = rng.normal(size=(T, K)).astype(np.float32)
+    ref = xs.astype(np.float16).astype(np.float32) @ w.numpy().astype(np.float32).T
+    np.testing.assert_allclose(nv_f16_gemm(w, Tensor(xs[:128]), K, N).numpy(), ref[:128], atol=2e-3, rtol=2e-3)
+    for live in (1, 70, T):
+      with self.subTest(live=live):
+        out = nv_f16_gemm(w, Tensor(xs).realize(), K, N, live=UOp.variable("gemm_tokens", 1, T).bind(live)).numpy()
+        np.testing.assert_allclose(out[:live], ref[:live], atol=2e-3, rtol=2e-3)
 
   def test_swiglu(self):
     # silu(gate)*up quantized inside the q8 kernel vs the product as an ordinary input: decode, static and symbolic prefill (gate and up
