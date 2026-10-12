@@ -182,7 +182,7 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
   group_size, words = (32, 36) if q4 else (16, 105)
   # weights per row per stage: 128-weight stages halve the barriers per K and their 90 KB need dynamic shared memory. Measured on an
   # RTX 4060 at 512 tokens, they speed up Q4_K with out_features <= in_features (attention 4096x4096 -7%, FFN down -6%) but slow
-  # the wide gate/up shapes (+10%) and Q6_K (+9%)
+  # the wide gate/up shapes (+5%) and Q6_K (+11%)
   SK = 128 if q4 and out_features <= in_features else 64
   parts, g64 = SK//64, 64//group_size  # 64-weight parts per stage, groups per part
   groups = SK//group_size
@@ -194,10 +194,11 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
   token_tiles = _tile(tokens//8, 4, 2, 1)
   token_warps = _tile(tokens//(8*token_tiles), 4, 2, 1)
   TN, TM, threads = 16*row_tiles*row_warps, 8*token_tiles*token_warps, 32*row_warps*token_warps
-  # a padded symbolic chunk launches only the token blocks holding its live tokens; token blocks vary fastest, so blocks
-  # sharing a weight tile run together and the weights come from L2
-  token_block = UOp.range(tokens//TM if live is None else (live.unbind_all()[0]+TM-1)//TM, 0, AxisType.GLOBAL)
-  row_block, lane = UOp.range(out_features//TN, 1, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
+  # a padded symbolic chunk launches only the token blocks holding its live tokens. Token blocks vary fastest (the last global
+  # axis is the launch's x), so the blocks sharing a weight tile run together and read it from L2: with the row blocks fastest,
+  # each weight tile came from DRAM once per token block (gate/up at 512 tokens read 116 MB instead of 31)
+  token_block = UOp.range(tokens//TM if live is None else (live.unbind_all()[0]+TM-1)//TM, 1, AxisType.GLOBAL)
+  row_block, lane = UOp.range(out_features//TN, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
   warp = UOp.range(row_warps*token_warps, 2, AxisType.LOCAL)
   tid, g, t = warp*32+lane, lane//4, lane%4
   row0, tok0 = row_block*TN, token_block*TM
