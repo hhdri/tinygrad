@@ -161,7 +161,7 @@ class CStyleLanguage(Renderer):
                        (self.var_suffix if u.addrspace == AddrSpace.ALU else self.buffer_suffix)) for name,(u,mutable) in bufs]
     local_dims = [u.src[0] for u in uops if u.op is Ops.SPECIAL and u.arg[0] == "l"]
     launch_bounds = prod([d.vmax for d in local_dims])
-    prg = ''.join([f"{self.kernel_typedef.format(launch_bounds=launch_bounds)} {function_name}(",] +
+    prg = ''.join([f"{self.kernel_typedef.format(launch_bounds=self.render_launch_bounds(launch_bounds))} {function_name}(",] +
     [', '.join([f'{t} {name}' for name,t in buftypes] + self.extra_args)] +
     [") {\n" + tmp] + ['\n'.join(kernel), "\n}"])
     return prg if prefix is None else "\n".join(prefix)+f"\n{prg}"
@@ -173,6 +173,8 @@ class CStyleLanguage(Renderer):
       return self[buf]+(f"[{idx.src[0].val}]" if buf.max_numel() > self.gep_arr_threshold else f".{'xyzwabcd'[idx.src[0].val]}")
     return f"({self[buf]}+{strip_parens(self[idx]) if idx.arg == Ops.ADD else self[idx]})"
 
+  min_blocks = 1
+  def render_launch_bounds(self, threads:int|float) -> str: return str(threads)
   def render_buffer(self, x:UOp):
     prefix = f"{self.smem_align}{self.smem_prefix}" if x.addrspace == AddrSpace.LOCAL else ""
     suffix = f"[{x.max_numel()}]"
@@ -226,7 +228,7 @@ class CStyleLanguage(Renderer):
         r[u] = r[u.src[0]]
         continue
       if u.op is Ops.SINK:
-        if u.arg is not None: name = u.arg.function_name
+        if u.arg is not None: name, self.min_blocks = u.arg.function_name, u.arg.min_blocks
         continue
       if u.op is Ops.PARAM:
         r[u] = (u.arg.name.replace(":", "_") if u.arg.name is not None else f"data{u.arg.slot}") + \
@@ -249,6 +251,7 @@ class CStyleLanguage(Renderer):
       if u.op in {Ops.ENDIF, Ops.END, Ops.BACKEDGE}: depth -= 1
       if (u.op is not Ops.CAST or u.max_numel() == 1) and ((u.op is Ops.CAST and u.src[0].op is Ops.CONST) or \
         u.op in {Ops.INDEX, Ops.SHRINK, Ops.CUSTOMI} or \
+        (u.op is Ops.STACK and all(x.op is Ops.CONST or (x.op is Ops.CAST and x.src[0].op is Ops.CONST) for x in u.src)) or \
         (u.op is Ops.LOAD and u.src[0].addrspace == AddrSpace.REG and child_count[u] == 1) or \
         (u.op in {Ops.CAST, Ops.BITCAST} and u.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL)) or \
         (u.op in {Ops.STACK, *(GroupOp.ALU-{Ops.WHERE}), Ops.CAST, Ops.BITCAST} and child_count[u] == 1 and not getenv("EXPAND_SSA"))):
@@ -447,10 +450,14 @@ class CUDARenderer(CStyleLanguage):
   string_rewrite = PatternMatcher([
     (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"tg_bitcast<{ctx.render_type(x)}>(({ctx.render_type(x.src[0])})({ctx[x.src[0]]}))"
      if x.addrspace not in (AddrSpace.GLOBAL, AddrSpace.LOCAL) else None),
+    # a LOCAL load flagged ldmatrix_xN loads MMA fragments of N 8x8 b16 matrices; each lane's address is one matrix row
+    (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x: f"tg_{x.arg}({ctx.render_ptr(bidx)})"
+     if isinstance(x.arg, str) and x.arg.startswith("ldmatrix_x") else None),
   ]) + base_rewrite
 
   # static __shared__ arrays are limited to 48 KB; above that a kernel's LOCAL buffers are carved out of dynamic shared memory, which
   # the runtimes size from ProgramInfo.shared_mem
+  def render_launch_bounds(self, threads:int|float) -> str: return f"{threads}, {self.min_blocks}" if self.min_blocks > 1 else str(threads)
   max_static_shared = 48*1024
   shared_offsets: dict[UOp, int] = {}
   def _render(self, uops:list[UOp]):
@@ -473,6 +480,12 @@ class CUDARenderer(CStyleLanguage):
     prefix = ["typedef unsigned int uint;", "#define INFINITY (__int_as_float(0x7f800000))", "#define NAN (__int_as_float(0x7fffffff))",
               "template <class T, class F> __device__ __forceinline__ T tg_bitcast(F v) { union U { F f; T t; }; U u; u.f = v; return u.t; }"]
     used_dtypes = uops_to_dtypes(uops)
+    for n, ty in ((1, "uint"), (2, "uint2"), (4, "uint4")):
+      if not any(u.op is Ops.LOAD and u.arg == f"ldmatrix_x{n}" for u in uops): continue
+      # the memory clobber keeps the load on its side of the barriers (the compiler can't see the asm read shared memory)
+      regs, outs = ", ".join(f"%{i}" for i in range(n)), ", ".join(f'"=r"(r{"." + "xyzw"[i] if n > 1 else ""})' for i in range(n))
+      prefix.append(f"__device__ __forceinline__ {ty} tg_ldmatrix_x{n}(const void* p) {{ {ty} r; asm volatile(\"ldmatrix.sync.aligned.m8n8.x{n}"
+                    f".shared.b16 {{" + regs + f"}}, [%{n}];\" : {outs} : \"r\"((unsigned)__cvta_generic_to_shared(p)) : \"memory\"); return r; }}")
     if any(dt in dtypes.fp8s for dt, _ in used_dtypes): prefix.append("#include <cuda_fp8.h>")
     if any(dt == dtypes.half for dt, _ in used_dtypes): prefix.append("#include <cuda_fp16.h>")
     if any(dt == dtypes.bfloat16 for dt, _ in used_dtypes): prefix.append("#include <cuda_bf16.h>")

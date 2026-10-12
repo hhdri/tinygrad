@@ -3,7 +3,7 @@ from tinygrad.device import Device
 from tinygrad.dtype import dtypes
 from tinygrad.codegen import to_program
 from tinygrad.helpers import Target
-from tinygrad.renderer.cstyle import CStyleLanguage
+from tinygrad.renderer.cstyle import CStyleLanguage, CUDARenderer
 from tinygrad.renderer.wgsl import WGSLRenderer
 from test.helpers import check_schedule
 from tinygrad.uop.ops import UOp, Ops, KernelInfo, python_alu
@@ -41,6 +41,39 @@ class TestWGSLFailures(unittest.TestCase):
     src = WGSLRenderer(Target("WEBGPU")).render(UOp.sink(store, arg=KernelInfo()).toposort())
     self.assertIn("atomicAnd(&data0_4[0],4294967040u);", src)
     self.assertNotIn("atomicAdd", src)
+
+class TestCUDAFailures(unittest.TestCase):
+  def test_guarded_vector_load_inline_zero(self):
+    # a named zero vector as the fallback of guarded vector loads makes nvcc spill it and select between pointers, demoting the
+    # predicated global loads to generic loads (a symbolic F16 matmul ran 30% slower); the constant must render inline
+    a, b = (Tensor.empty(30, 64, dtype=dtypes.half).pad(((0, 2), (0, 0))) for _ in range(2))
+    linear, _ = check_schedule((a + b).contiguous(), 1)
+    src = to_program(linear.src[0].src[0], CUDARenderer(Target("CUDA", arch="sm_89"))).src[2].arg
+    self.assertEqual(src.count(":make_half4("), 2)
+    self.assertNotIn("half4 cast", src)
+
+  def _render(self, kernel) -> str:
+    from tinygrad.uop.ops import AxisType, AddrSpace
+    out, inp = UOp.param(0, dtypes.uint32, 256), UOp.param(1, dtypes.uint32, 256)
+    lane, buf = UOp.range(32, 0, AxisType.WARP), UOp.alloc((256,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+    return to_program(kernel(out, inp, lane, buf), CUDARenderer(Target("CUDA", arch="sm_89"))).src[2].arg
+
+  def test_min_blocks_launch_bounds(self):
+    # KernelInfo.min_blocks becomes __launch_bounds__'s minimum blocks per SM, so the compiler caps registers for that occupancy
+    def kernel(out, inp, lane, buf):
+      return out[lane].store(inp[lane]).end(lane).sink(arg=KernelInfo(name="lb", opts_to_apply=(), min_blocks=2))
+    self.assertIn("__launch_bounds__(32, 2)", self._render(kernel))
+
+  def test_ldmatrix_load(self):
+    # a LOCAL load flagged ldmatrix_x4 renders as the ldmatrix helper (with a memory clobber, so it stays between its barriers)
+    def kernel(out, inp, lane, buf):
+      buf = buf.after(UOp.group(*[buf[lane*8+i].store(inp[lane*8+i]) for i in range(8)]).barrier())
+      frag = UOp(Ops.SHRINK, src=(buf, lane*8, UOp.const(4))).load(arg="ldmatrix_x4")
+      return UOp.group(*[out[lane*4+i].store(frag[i]) for i in range(4)]).end(lane).sink(arg=KernelInfo(name="ldm", opts_to_apply=()))
+    src = self._render(kernel)
+    self.assertIn("tg_ldmatrix_x4(", src)
+    self.assertIn('ldmatrix.sync.aligned.m8n8.x4.shared.b16', src)
+    self.assertIn('"memory"', src)
 
 if __name__ == '__main__':
   unittest.main()

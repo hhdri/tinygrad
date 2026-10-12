@@ -1324,6 +1324,7 @@ class KernelInfo:
   opts_to_apply: tuple|None = None
   estimates: Estimates|None = None
   beam: int = 0
+  min_blocks: int = 1           # blocks per SM the kernel's register use must allow (CUDA __launch_bounds__ minBlocksPerMultiprocessor)
   @property
   def function_name(self): return to_function_name(self.name)
 
