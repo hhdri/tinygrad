@@ -560,6 +560,9 @@ class Transformer:
     model = Transformer(config)
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    # small parameters (norm weights, biases) are realized once: a custom kernel takes its inputs as buffers, and a lazy GGUF view
+    # would be copied out on every call
+    if not realize: Tensor.realize(*[s.replace(s.contiguous()) for s in nn.state.get_parameters(model) if s.numel() <= 65536])
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
