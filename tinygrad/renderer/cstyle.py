@@ -1,10 +1,10 @@
 from typing import Literal, Callable
-import math, sys
+import math, sys, itertools
 from collections import defaultdict, Counter
 from tinygrad.renderer import tc
 from tinygrad.uop.ops import GroupOp, Ops, UOp, PatternMatcher, UPat, range_str, axis_letters
 from tinygrad.uop.weak import commit_weak_consts
-from tinygrad.helpers import strip_parens, getenv, prod, dedup, Target, IMAGE, FLOAT16, is_image_shape
+from tinygrad.helpers import strip_parens, getenv, prod, dedup, round_up, Target, IMAGE, FLOAT16, is_image_shape
 from tinygrad.dtype import dtypes, DType, AddrSpace, truncate, to_storage_scalar
 from tinygrad.renderer import Renderer
 
@@ -450,6 +450,19 @@ class CUDARenderer(CStyleLanguage):
      if x.addrspace not in (AddrSpace.GLOBAL, AddrSpace.LOCAL) else None),
   ]) + base_rewrite
 
+  # static __shared__ arrays are limited to 48 KB; above that a kernel's LOCAL buffers are carved out of dynamic shared memory, which
+  # the runtimes size from ProgramInfo.shared_mem
+  max_static_shared = 48*1024
+  shared_offsets: dict[UOp, int] = {}
+  def _render(self, uops:list[UOp]):
+    local = [u for u in uops if u.op is Ops.BUFFER and u.addrspace == AddrSpace.LOCAL]
+    sizes = [round_up(u.max_numel()*u.dtype.itemsize, 16) for u in local]
+    self.shared_offsets = dict(zip(local, itertools.accumulate([0]+sizes))) if sum(sizes) > self.max_static_shared else {}
+    return super()._render(uops)
+  def render_buffer(self, x:UOp):
+    if (off:=self.shared_offsets.get(x)) is None: return super().render_buffer(x)
+    return f"{self._render_dtype(x.dtype)}* {self[x]} = ({self._render_dtype(x.dtype)}*)(tg_shared+{off});"
+
   def render_vector_prefix(self, dt:DType, count:int) -> str:
     vec, scal = self._render_dtype(dt, count, AddrSpace.REG), self.render_dtype(dt)
     elems, header = ', '.join(_nms[:count]), ', '.join([f"{scal} {x}" for x in _nms[:count]])
@@ -457,6 +470,7 @@ class CUDARenderer(CStyleLanguage):
            f"__device__ {vec} make_{vec}({header}) {{ {vec} r={{{elems}}}; return r; }}"
 
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
+    if self.shared_offsets: kernel = ["  extern __shared__ __align__(16) unsigned char tg_shared[];"] + kernel
     prefix = ["typedef unsigned int uint;", "#define INFINITY (__int_as_float(0x7f800000))", "#define NAN (__int_as_float(0x7fffffff))",
               "template <class T, class F> __device__ __forceinline__ T tg_bitcast(F v) { union U { F f; T t; }; U u; u.f = v; return u.t; }"]
     used_dtypes = uops_to_dtypes(uops)

@@ -229,7 +229,7 @@ class NVEncDecQueue(NVQueue):
 # programs
 
 class NVProgramData:
-  def __init__(self, dev:NVDevice, obj:TinyELF):
+  def __init__(self, dev:NVDevice, obj:TinyELF, shared_mem:int=0):
     name, signature, mock = obj.name, obj.signature, isinstance(dev.iface, MOCKIface)
     self.constbufs: dict[int, tuple[int, int]] = {0: (0, 0x160)} # dict[constbuf index, tuple[offset in the image, size]]
     self.relocs: list[tuple[int, int, DType, int]] = [] # (byte offset in the image, symbol offset, width, shift) of the program's address
@@ -282,6 +282,8 @@ class NVProgramData:
     # Ensure device has enough local memory to run the program
     dev._ensure_has_local_memory(lcmem)
 
+    # dynamic shared memory (kernels above the 48 KB static limit) isn't in the ELF, the program says how much the kernel uses
+    if not NAK: shmem = max(shmem, round_up(0x400 + shared_mem, 128))
     if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A:
       if not NAK: self.cbuf_0[188:192], self.cbuf_0[223] = [*data64_le(dev.shared_mem_window), *data64_le(dev.local_mem_window)], 0xfffdc0
       qmd = {'qmd_major_version':5, 'qmd_type':nv_gpu.NVCEC0_QMDV05_00_QMD_TYPE_GRID_CTA, 'register_count':regs,
@@ -312,7 +314,7 @@ class NVProgramData:
       start_off += (sz if typ == 0x4 else 0) + 4
 
 def nv_build_program(dev:NVDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[NVProgramData, UOp]:
-  data = NVProgramData(dev, prg.to_elf())
+  data = NVProgramData(dev, prg.to_elf(), prg.arg.shared_mem)
   buf = make_program(prg, len(data.image), devs[0])
   rows = [(off, ((buf.getaddr(devs) + sym) >> sh).ccast(dt)) for off, sym, dt, sh in data.relocs]
   return data, patch(buf, rows, data.image)
