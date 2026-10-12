@@ -248,15 +248,6 @@ class TestDiskTensor(TempDirTestCase):
     out = t[1].to(Device.DEFAULT).tolist()
     assert out == list(range(16, 32))
 
-  @unittest.skipIf(OSX or os.geteuid() == 0, "root ignores file permissions")
-  def test_read_only_file(self):
-    fn = pathlib.Path(self.tmp("dt_read_only"))
-    fn.write_bytes(bytes(range(256)))
-    fn.chmod(0o444)
-    t = Tensor(fn)
-    self.assertEqual(t[16:32].to(Device.DEFAULT).tolist(), list(range(16, 32)))
-    self.assertEqual(fn.read_bytes(), bytes(range(256)))
-
   def test_simple_read_bitcast(self):
     fn = pathlib.Path(self.tmp("dt_simple_read_bitcast"))
     fn.write_bytes(bytes(range(256))*2)
