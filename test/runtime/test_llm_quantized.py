@@ -2,7 +2,8 @@ import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid, flash_attention
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq, nv_flash_attention, nv_mmq_supported, nv_qk_prep, nv_rmsnorm_q8
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq, nv_flash_attention, nv_mmq_supported, nv_qk_prep, nv_rmsnorm_q8, \
+  nv_flash_decode_q8
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
@@ -204,6 +205,25 @@ class TestNVQuantLinear(unittest.TestCase):
         np.testing.assert_allclose(q*d, ref, atol=float(d.max())*0.51)
         sums = q.reshape(-1, 16).sum(-1)
         np.testing.assert_allclose(xs.numpy().reshape(-1), sums)
+
+  def test_flash_decode_q8(self):
+    # the flash-decoding combine with q8 output vs the shared combine's float output (dequantized within a step)
+    from tinygrad.llm.kernels.amd import flash_attention
+    rng = np.random.default_rng(6)
+    H, HKV, D, N = 32, 8, 128, 512
+    q = Tensor(rng.normal(size=(1, H, 1, D)).astype(np.float16)).realize()
+    cache = Tensor(rng.normal(size=(2, 1, HKV, N, D)).astype(np.float16)).realize()
+    for end in (1, 77, N):
+      with self.subTest(valid_end=end):
+        v = UOp.variable("start_pos", 1, N).bind(end)
+        attn, q8 = nv_flash_decode_q8(q, cache, v, N)
+        xq, xd, xs = q8[(1, H*D, True)]
+        Tensor.realize(xq, xd, xs)
+        ref = flash_attention(q, cache, v).numpy().reshape(-1)
+        qv = xq.numpy().reshape(-1).view(np.int8).astype(np.float32)
+        d = np.repeat(xd.numpy().reshape(-1), 32)
+        np.testing.assert_allclose(qv*d, ref, atol=float(d.max())*0.51+1e-6)
+        np.testing.assert_allclose(xs.numpy().reshape(-1), qv.reshape(-1, 16).sum(-1))
 
   def test_swiglu(self):
     # silu(gate)*up quantized inside the q8 kernel vs the product as an ordinary input: decode, static and symbolic prefill (gate and up

@@ -635,6 +635,54 @@ def nv_rmsnorm_q8(parts:list[Tensor], weight:Tensor, eps:float, write_sum:bool=F
   xn = extra[-1].reshape(shape) if write_normed else None
   return h, xn, {(1, dim, True): (xq, xd, xs)}
 
+# ******** decode: flash-decoding combine with the o-proj input's q8 quantization ********
+
+@functools.cache
+def _combine_q8_kernel(xq:UOp, xd:UOp, xs:UOp, partial:UOp, stats:UOp, live:UOp|int) -> UOp:
+  # one warp per head: the flash-decoding combine (max over the live chunks, then their weighted partial sums) of the head's D=128
+  # outputs, four per lane, then their q8 quantization as in q8_quantize: a head is one 128-value chunk of the o-proj input
+  live = live.unbind_all()[0] if isinstance(live, UOp) else live
+  H = int(partial.shape[1])
+  warps = _tile(H, 8, 4, 2, 1)
+  block, lane, warp = UOp.range(H//warps, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP), UOp.range(warps, 1, AxisType.LOCAL)
+  h = block*warps + warp
+  def reg(n:int, val:float, dep:UOp|None=None) -> UOp:
+    r = UOp.alloc((n,), dtypes.float32, addrspace=AddrSpace.REG)
+    return r.after((r if dep is None else r.after(dep)).store(UOp.stack(*(UOp.const(val, dtypes.float32) for _ in range(n)))))
+  c1 = UOp.range(live, 100, AxisType.LOOP)
+  mx = reg(1, -math.inf)
+  mx = mx.after(mx[0].store(mx.after(c1)[0].load().maximum(stats[0, h, c1, 0].load())).end(c1))
+  c2 = UOp.range(live, 101, AxisType.LOOP)
+  acc = reg(5, 0.0, mx)
+  w = ((stats[0, h, c2, 0].load() - mx[0].load())*LOG2E).exp2()
+  cur = acc.after(c2)
+  acc = acc.after(acc.store(UOp.stack(*(cur[i].load() + w*partial[0, h, c2, lane*4 + i].load() for i in range(4)),
+                                      cur[4].load() + w*stats[0, h, c2, 1].load())).end(c2))
+  inv = 1/acc[4].load()
+  vals = [acc[i].load()*inv for i in range(4)]
+  amax = functools.reduce(UOp.maximum, (x.abs() for x in vals))
+  d = _custom("({0}/127.0f)", dtypes.float, warp_reduce(amax, maximum=True, width=8)).maximum(1e-30)
+  quants = [_custom("rintf({0}/{1})", dtypes.float, x, d).clip(-127, 127) for x in vals]
+  word = functools.reduce(UOp.bitwise_or, (q.cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i,q in enumerate(quants)))
+  group, wl = h*4 + lane//8, lane%8
+  stores = (xq[0, h*32 + lane].store(word), xd[group.valid(wl.eq(0)), 0].store(d),
+            xs[group*2 + (wl//4).valid((wl%4).eq(0)), 0].store(warp_reduce(sum(quants[1:], quants[0]), width=4)))
+  return UOp.group(*stores).end(block, lane, warp).sink(arg=KernelInfo(name="flash_decode_combine_q8", opts_to_apply=()))
+
+def nv_flash_decode_q8(q:Tensor, assigned_kv:Tensor, valid_end:UOp, max_kv_len:int) -> tuple[Tensor, dict]:
+  # single-token attention through the shared flash-decoding kernel, combined straight into the o-proj input's q8 (Linear.project's
+  # shared quantized input); also returns the (lazy, unrealized unless used) float output for other consumers
+  from tinygrad.llm.kernels.amd import amd_flash_attention_decode
+  H, D = q.shape[1], q.shape[3]
+  def combine(partial:Tensor, stats:Tensor, live) -> tuple[Tensor, Tensor, Tensor]:
+    xq = Tensor.empty(1, H*D//4, dtype=dtypes.uint32, device=q.device)
+    xd, xs = Tensor.empty(H*D//32, 1, dtype=dtypes.float32, device=q.device), Tensor.empty(H*D//16, 1, dtype=dtypes.float32, device=q.device)
+    if isinstance(live, UOp): xq = Tensor(xq.uop.after(live))  # carries the binding into the kernel
+    xq, xd, xs = Tensor.custom_kernel(xq, xd, xs, partial, stats, fxn=functools.partial(_combine_q8_kernel, live=live))[:3]
+    return xq, xd, xs
+  xq, xd, xs = amd_flash_attention_decode(q, assigned_kv, valid_end, max_kv_len, combine=combine)
+  return amd_flash_attention_decode(q, assigned_kv, valid_end, max_kv_len), {(1, H*D, True): (xq, xd, xs)}
+
 # ******** decode: attention prologue ********
 
 @functools.cache

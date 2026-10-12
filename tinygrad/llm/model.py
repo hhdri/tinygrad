@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, silu_gate, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import nv_flash_attention, nv_flash_attention_supported, nv_mmq_supported, nv_qk_prep, nv_qk_prep_supported, \
-  nv_rmsnorm_q8, nv_rmsnorm_q8_supported
+  nv_rmsnorm_q8, nv_rmsnorm_q8_supported, nv_flash_decode_q8
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
 from tinygrad.uop.ops import resolve, Ops
 
@@ -227,7 +227,9 @@ class TransformerBlock(FFNBlock):
        isinstance(start_pos, UOp) and (q_norm:=self.attn_q_norm.weight) is not None and (k_norm:=self.attn_k_norm.weight) is not None:
       qh, assigned_kv = nv_qk_prep(q, k, v, q_norm, k_norm, self.freqs_cis, self.cache_kv, start_pos, cfg.n_heads, cfg.n_kv_heads,
                                    cfg.head_dim, cfg.norm_eps)
-      return self.attn_output(flash_attention(qh, assigned_kv, start_pos+T).transpose(1, 2).reshape(B, T, -1))
+      # the flash-decoding combine writes the o-proj input's q8 directly (one head is one 128-value q8 chunk)
+      attn, q8o = nv_flash_decode_q8(qh, assigned_kv, start_pos+T, cfg.max_context)
+      return self.attn_output(attn.transpose(1, 2).reshape(B, T, -1), q8=q8o)
     # v gets its own kernel: fused into the stacked KV cache store, the k half of the store would also run the v matmul
     v = _own_kernel(v)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
