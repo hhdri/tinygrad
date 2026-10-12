@@ -413,10 +413,10 @@ def _q6k_mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_fe
         st.append(wsb[gi, rr, e].store(d*byte(hb+192+h*8+gi*2+e).cast(dtypes.uint8).bitcast(dtypes.int8).float()))
     return st
   seed = UOp.stack(*(UOp.const(0x4b400000, dtypes.int32) for _ in range(4)))
-  def compute(wqb:UOp, aqb:UOp, wsb:UOp, tsb:UOp, cur:UOp, axis:int) -> UOp:
+  def compute(wqb:UOp, aqb:UOp, wsb:UOp, tsb:UOp, cur:UOp, axis:int, copies:list[UOp]) -> UOp:
     # the 4 groups of a half are a real loop (as in llama.cpp / Rust): unrolled, every group's fragments were live at once
     gi = UOp.range(4, axis, AxisType.LOOP)
-    c = cur.after(gi)
+    c = cur.after(gi, *copies)  # the next super-block's copies are issued before this loop and overlap it
     values = [c[i].load() for i in range(MT*NT*4)]
     afr = [_ldm(wqb, (row:=wr+mt*16+lane%8+(lane//8%2)*8)*32 + ((gi*2+lane//16) ^ (row%8))*4, 4) for mt in range(MT)]
     bfr = [_ldm(aqb, (tok:=tc+npair*16+lane%8+(lane//16)*8)*32 + ((gi*2+lane//8%2) ^ (tok%8))*4, 4) for npair in range(NT//2)]
@@ -450,7 +450,7 @@ def _q6k_mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_fe
     nsb_next, nh = (sbr, 1) if h == 0 else ((sbr+1).minimum(nsb-1), 0)
     regs = prefetch(nsb_next*2+nh)
     copies = raw_copies(nsb_next, rwb) if h == 1 else []
-    done = compute(wqb, aqb, wsb, tsb, cur, 10+h)
+    done = compute(wqb, aqb, wsb, tsb, cur, 10+h, copies)
     # the barrier ending the compute hangs directly on the copies' wait (an AFTER would drop a void CUSTOM); the wait reads the
     # accumulators, so it follows every shared read of this half
     b1 = _cp_wait(*copies, done[0].load()).barrier() if copies else UOp.group(done).barrier()
@@ -515,9 +515,9 @@ def _q4k_mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_fe
       st += [wsb[gi, rr, 0].store(_half(head & 0xffff)*scale.float()), wsb[gi, rr, 1].store(_half(head >> 16)*mn.float())]
     return st
   seed = UOp.stack(*(UOp.const(0x4b400000, dtypes.int32) for _ in range(4)))
-  def compute(wqb:UOp, aqb:UOp, wsb:UOp, tsb:UOp, cur:UOp, axis:int) -> UOp:
+  def compute(wqb:UOp, aqb:UOp, wsb:UOp, tsb:UOp, cur:UOp, axis:int, copies:list[UOp]) -> UOp:
     gi = UOp.range(4, axis, AxisType.LOOP)
-    c = cur.after(gi)
+    c = cur.after(gi, *copies)  # the next super-block's copies are issued before this loop and overlap it
     values = [c[i].load() for i in range(MT*NT*4)]
     afr = [_ldm(wqb, (row:=wr+mt*16+lane%8+(lane//8%2)*8)*32 + ((gi*2+lane//16) ^ (row%8))*4, 4) for mt in range(MT)]
     bfr = [_ldm(aqb, (tok:=tc+npair*16+lane%8+(lane//16)*8)*32 + ((gi*2+lane//8%2) ^ (tok%8))*4, 4) for npair in range(NT//2)]
@@ -547,7 +547,7 @@ def _q4k_mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_fe
     nsb_next, nh = (sbr, 1) if h == 0 else ((sbr+1).minimum(nsb-1), 0)
     regs = prefetch(nsb_next*2+nh)
     copies = raw_copies(nsb_next, rwb) if h == 1 else []
-    done = compute(wqb, aqb, wsb, tsb, cur, 10+h)
+    done = compute(wqb, aqb, wsb, tsb, cur, 10+h, copies)
     b1 = _cp_wait(*copies, done[0].load()).barrier() if copies else UOp.group(done).barrier()
     nxt = tuple(b.after(b1) for b in bufs)
     b2 = UOp.group(*stage_stores(nsb_next, nh, regs, *nxt)).barrier()
