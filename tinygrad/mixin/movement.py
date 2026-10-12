@@ -228,11 +228,7 @@ class MovementMixin:
     order_arg = tuple(self._resolve_dim(x) for x in argfix(order, *args))
     if sorted(order_arg) != list(range(self.ndim)):
       raise RuntimeError(f"order is not a valid permutation, getting {order_arg}")
-    if order_arg == tuple(range(self.ndim)): return self
-    # moving only size-1 axes keeps the memory order: a reshape, which stays a view of a kernel output where a permute is copied
-    if (kept:=[o for o in order_arg if resolve(self.shape[o] != 1, True)]) == sorted(kept):
-      return self.reshape(tuple(self.shape[o] for o in order_arg))
-    return self._mop(Ops.PERMUTE, arg=order_arg)
+    return self._mop(Ops.PERMUTE, arg=order_arg) if order_arg != tuple(range(self.ndim)) else self
 
   def flip(self, axis, *args) -> Self:
     """

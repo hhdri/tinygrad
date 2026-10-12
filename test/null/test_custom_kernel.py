@@ -122,14 +122,6 @@ class TestCustomKernel(unittest.TestCase):
     out.realize()
     assert_kernel_count(5)
 
-  def test_size1_transpose_of_output_no_copy(self):
-    # moving only size-1 axes (decode attention's (B,H,1,D) -> (B,1,H*D)) is a reshape: the output stays a view, no copy kernel
-    out = Tensor.custom_kernel(Tensor.empty(1, 4, 1, 8), Tensor.empty(1, 4, 1, 8), Tensor.empty(1, 4, 1, 8), fxn=custom_elementwise_add_kernel)[0]
-    self.assertIs(out.transpose(1, 2).uop.op, Ops.RESHAPE)
-    GlobalCounters.reset()
-    out.transpose(1, 2).reshape(1, 1, 32).contiguous().realize()
-    assert_kernel_count(1)
-
   def test_multi_after_schedule_order(self):
     """Test correct scheduling order when custom_kernel has multiple outputs.
 
