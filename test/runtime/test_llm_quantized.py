@@ -173,7 +173,8 @@ class TestNVQuantLinear(QuantLinearMixin, unittest.TestCase):
     if not self.mmq: self.skipTest("SM80 required")
     rng = np.random.default_rng(11)
     for typ in (12, 14):
-      # 384 padded tokens span three 128-token blocks: 3 and 16 live tokens launch only the first, 130 and 200 two, 300 all
+      # 384 padded tokens span three 128-token blocks: 3 and 16 live tokens launch only the first, 130 and 200 two, 300 all. Live counts
+      # ending in a 1-64 token tail (3, 16, 130, and 300 for Q4_K) run on the 64-token-block kernels, the others on the 128-token ones
       layer = Linear(1024, 128, bias=False)
       layer.weight = _packed(rng, typ, 128, 1024)[1]
       for tokens in (3, 16, 100, 130, 200, 300):

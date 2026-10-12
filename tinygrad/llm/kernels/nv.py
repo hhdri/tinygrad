@@ -72,7 +72,7 @@ def _q8_quantize_kernel(xq:UOp, xd:UOp, xs:UOp, x:UOp, tokens:int, in_features:i
   quants = [_custom("rintf({0}/{1})", dtypes.float, v, d).clip(-127, 127) for v in values]
   word = functools.reduce(UOp.bitwise_or, (q.cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i,q in enumerate(quants)))
   group, w = chunk*4 + lane//8, lane%8
-  # group major scales and sums: a Q4_K MMQ token block reads a group's values contiguously (the Q6_K MMQ stages token major)
+  # group major scales and sums: a Q4_K MMQ token block reads a group's values contiguously (Q6_K's staging prefers token major)
   def at(buf:UOp, g:UOp) -> UOp: return buf[g, token] if group_major else buf[token, g]
   stores = (xq[token, chunk*32 + lane].store(word), at(xd, group.valid(w.eq(0))).store(d),
             at(xs, group*2 + (w//4).valid((w%4).eq(0))).store(warp_reduce(sum(quants[1:], quants[0]), width=4)))
@@ -179,7 +179,7 @@ def nv_f16_gemv(weight:Tensor, x:Tensor, in_features:int, out_features:int) -> T
 
 @functools.cache
 def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_features:int, in_features:int, ggml_type:int,
-                live:UOp|None=None) -> UOp:
+                live:UOp|None=None, small_tail:int|None=None) -> UOp:
   # Each warp owns row_tiles 16-row x token_tiles 8-token MMA tiles, so every weight fragment feeds token_tiles MMAs and every
   # activation fragment row_tiles MMAs. The block stages 64 weights per row at a time: it unpacks its rows to int8 words in
   # shared memory, decodes each row's group coefficients once, and stages the activations next to them.
@@ -200,7 +200,7 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
   # a padded symbolic chunk launches only the token blocks holding its live tokens. Token blocks vary fastest (the last global
   # axis is the launch's x), so the blocks sharing a weight tile run together and read it from L2: with the row blocks fastest,
   # each weight tile came from DRAM once per token block (gate/up at 512 tokens read 116 MB instead of 31)
-  token_block = UOp.range(tokens//TM if live is None else (live.unbind_all()[0]+TM-1)//TM, 1, AxisType.GLOBAL)
+  token_block = UOp.range(tokens//TM if live is None else _live_blocks(live.unbind_all()[0], TM, small_tail), 1, AxisType.GLOBAL)
   row_block, lane = UOp.range(out_features//TN, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
   warp = UOp.range(row_warps*token_warps, 2, AxisType.LOCAL)
   tid, g, t = warp*32+lane, lane//4, lane%4
@@ -319,6 +319,14 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
           for r in range(row_tiles) for j in range(token_tiles) for i in range(4)]
   return UOp.group(*outs).end(token_block, row_block, lane, warp).sink(arg=KernelInfo(name="q4k_mmq" if q4 else "q6k_mmq", opts_to_apply=()))
 
+def _live_blocks(n:UOp, TM:int, small_tail:int|None) -> UOp:
+  # token blocks over the live tokens. A small_tail kernel pair splits by live count: the 64-token-block kernel (TM=64) runs only when the
+  # live tokens end in a 1-64 token tail past the last full 128-token block and number fewer than small_tail, the 128-token one otherwise
+  blocks = (n+TM-1)//TM
+  if small_tail is None: return blocks
+  tail = n % 128
+  cond = (tail > 0) & (tail < 65) & (n < small_tail)
+  return cond.where(blocks, 0) if TM == 64 else cond.where(0, blocks)
 
 def _cp_async(dst:UOp, src:UOp, nbytes:UOp) -> UOp:
   # 16-byte global -> shared copy that holds no registers; bytes past nbytes are zero filled
@@ -327,6 +335,214 @@ def _cp_async(dst:UOp, src:UOp, nbytes:UOp) -> UOp:
 def _cp_wait(*copies:UOp) -> UOp: return _custom('asm volatile("cp.async.wait_all;" ::: "memory");', dtypes.void, *copies)
 def _ldm(buf:UOp, idx:UOp, n:int, trans:bool=False) -> UOp:
   return UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(n))).load(arg=f"ldmatrix_x{n}{'_trans' if trans else ''}")
+def _bytes(word:UOp) -> UOp: return UOp.stack(*((word >> (i*8)).cast(dtypes.uint8).bitcast(dtypes.int8) for i in range(4)))
+
+@functools.cache
+def _q6k_mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_features:int, in_features:int, live:UOp|None=None,
+                    TN:int=64, TM:int=128, small_tail:int|None=None) -> UOp:
+  # Q6_K MMQ that stages without registers, so two blocks fit per SM: each row's 210-byte super-block arrives raw through cp.async
+  # (its 16-byte aligned envelope, once per super-block) and is unpacked to signed int8 in shared memory per 128-weight half; the
+  # q8 activations are prefetched into registers. Single shared buffers, two barriers per half. Warps own 2x4 m16n8k16 tiles; each
+  # 32-group runs two magic-seeded k16 MMAs (one per 16-weight scale). xd is group major; xs is unused (Q6_K has no mins).
+  threads, nsb, MT, NT = 256, in_features//256, TN//32, TM//32  # 8 warps (2 row x 4 token) of TN/2 rows x TM/4 tokens
+  n = None if live is None else live.unbind_all()[0]
+  token_block = UOp.range(tokens//TM if n is None else _live_blocks(n, TM, small_tail), 1, AxisType.GLOBAL)
+  row_block, lane = UOp.range(out_features//TN, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
+  warp = UOp.range(8, 2, AxisType.LOCAL)
+  tid, g8, t4 = warp*32+lane, lane//4, lane%4
+  row0, tok0, wr, tc = row_block*TN, token_block*TM, (warp//4)*(TN//2), (warp%4)*(TM//4)
+  # 16-byte chunks of the weight and activation rows are XOR-swizzled by row, so ldmatrix and the unpack stores avoid bank conflicts
+  wq = UOp.alloc((TN, 32), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  aq = UOp.alloc((TM, 32), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  ws = UOp.alloc((4, TN, 2), dtypes.float32, addrspace=AddrSpace.LOCAL)
+  ts = UOp.alloc((4, TM), dtypes.float32, addrspace=AddrSpace.LOCAL)
+  rw = UOp.alloc((TN, 56), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  def start(r:UOp, sb:UOp) -> UOp: return ((row0+r)*nsb+sb)*210  # byte offset of row r's super-block (the tensor starts 32B aligned)
+  def raw_copies(sb:UOp, rwb:UOp) -> list[UOp]:  # rwb orders the copies after the last unpack of the previous super-block
+    ops = []
+    for i in range((TN*14+threads-1)//threads):
+      idx = (tid+i*threads).minimum(TN*14-1)  # the last round's spare threads repeat a copy
+      r, vec = idx//14, idx%14
+      src = start(r, sb)//16*16 + vec*16
+      ops.append(_cp_async(rwb[r, vec*4], raw[src//2], (start(r, sb)+210-src).maximum(0).minimum(16)))
+    return ops
+  def prefetch(stage:UOp) -> tuple[list, list]:
+    acts = [(it, _vload(xq, (tok0+it//8)*(in_features//4) + stage*32 + (it%8)*4, 4)) for it in (tid+i*threads for i in range(TM*8//threads))]
+    scales = [(it, xd[stage*4+it//TM, tok0+it%TM].load()) for it in (tid+i*threads for i in range(4*TM//threads))]
+    return acts, scales
+  def stage_stores(sb:UOp, h:int, regs:tuple[list, list], rwb:UOp, wqb:UOp, aqb:UOp, wsb:UOp, tsb:UOp) -> list[UOp]:
+    acts, scales = regs
+    st = [aqb[it//8, ((it%8) ^ (it//8%8))*4+j].store(v[j]) for it, v in acts for j in range(4)]
+    st += [tsb[it//TM, it%TM].store(v) for it, v in scales]
+    flat = rwb.flatten()
+    def word(p:UOp, j:int) -> UOp:  # the 4 bytes at byte p+4j of the raw rows, p two-byte aligned
+      return _custom("__funnelshift_r({0}, {1}, {2})", dtypes.uint32, flat[p//4+j].load(), flat[p//4+j+1].load(), ((p%4)*8).cast(dtypes.uint32))
+    # unpack: item (row, 16-weight half hcol, group pair gp): ql bytes l and l+32 of this half, then its qh bytes
+    for it in (tid+i*threads for i in range(TN*4//threads)):
+      r, hcol, gp = it//2%TN, it%2, it//(2*TN)
+      base = r*224 + start(r, sb)%16
+      wreg = [word(base+off, j) for off in (h*64+hcol*16, h*64+32+hcol*16, 128+h*32+hcol*16) for j in range(4)]
+      for k in range(2):
+        grp = gp*2+k  # groups 0, 1 take the low nibbles of ql[l], ql[l+32]; 2, 3 the high ones
+        vals = []
+        for w in range(4):
+          code = ((wreg[4*k+w] >> (gp*4).cast(dtypes.uint32)) & 0x0f0f0f0f) | (((wreg[8+w] >> (grp*2).cast(dtypes.uint32)) & 0x03030303) << 4)
+          vals.append(((code | 0x80808080) - 0x20202020) ^ 0x80808080)  # bytewise code-32
+        st += [wqb[r, ((grp*2+hcol) ^ (r%8))*4+w].store(v) for w, v in enumerate(vals)]
+    # coefficients: item (group, row): d times the int8 scales of the group's two 16-weight halves
+    def byte(p:UOp) -> UOp: return (flat[p//4].load() >> ((p%4)*8).cast(dtypes.uint32)) & 0xff
+    for it in (tid+i*threads for i in range(4*TN//threads)):
+      gi, rr = it//TN, it%TN
+      hb = rr*224 + start(rr, sb)%16
+      d = _half((flat[(hb+208)//4].load() >> (((hb+208)%4)*8).cast(dtypes.uint32)) & 0xffff)
+      for e in range(2):
+        st.append(wsb[gi, rr, e].store(d*byte(hb+192+h*8+gi*2+e).cast(dtypes.uint8).bitcast(dtypes.int8).float()))
+    return st
+  seed = UOp.stack(*(UOp.const(0x4b400000, dtypes.int32) for _ in range(4)))
+  def compute(wqb:UOp, aqb:UOp, wsb:UOp, tsb:UOp, cur:UOp, axis:int, copies:list[UOp]) -> UOp:
+    # the 4 groups of a half are a real loop (as in llama.cpp / Rust): unrolled, every group's fragments were live at once
+    gi = UOp.range(4, axis, AxisType.LOOP)
+    c = cur.after(gi, *copies)  # the next super-block's copies are issued before this loop and overlap it
+    values = [c[i].load() for i in range(MT*NT*4)]
+    afr = [_ldm(wqb, (row:=wr+mt*16+lane%8+(lane//8%2)*8)*32 + ((gi*2+lane//16) ^ (row%8))*4, 4) for mt in range(MT)]
+    bfr = [_ldm(aqb, (tok:=tc+npair*16+lane%8+(lane//16)*8)*32 + ((gi*2+lane//8%2) ^ (tok%8))*4, 4) for npair in range(NT//2)]
+    wl = [wsb[gi, wr+(r//2)*16+g8+(r%2)*8, e].load() for r in range(2*MT) for e in range(2)]
+    bias = [w*-MAGIC for w in wl]
+    for nt in range(NT):
+      tok = tc+nt*8+2*t4
+      xs0, xs1 = tsb[gi, tok].load(), tsb[gi, tok+1].load()
+      blo, bhi = bfr[nt//2][(nt%2)*2], bfr[nt//2][(nt%2)*2+1]
+      for mt in range(MT):
+        lo = UOp.wmma(UOp.stack(afr[mt][0], afr[mt][1]).bitcast(dtypes.int8), _bytes(blo), seed, (8,16,16), 32)
+        hi = UOp.wmma(UOp.stack(afr[mt][2], afr[mt][3]).bitcast(dtypes.int8), _bytes(bhi), seed, (8,16,16), 32)
+        for i in range(4):
+          k = (mt*2+i//2)*2
+          v = _fma(lo[i].bitcast(dtypes.float32), wl[k], bias[k]) + _fma(hi[i].bitcast(dtypes.float32), wl[k+1], bias[k+1])
+          o = (mt*NT+nt)*4+i
+          values[o] = _fma(v, xs0 if i%2 == 0 else xs1, values[o])
+    return cur.after(c.store(UOp.stack(*values)).end(gi))
+  acc = UOp.alloc((MT*NT*4,), dtypes.float32, addrspace=AddrSpace.REG)
+  acc = acc.after(acc.store(acc.const_like(0)))
+  zero = UOp.const(0, dtypes.weakint)
+  # prologue: super-block 0 arrives, half 0 is staged
+  pro = _cp_wait(*raw_copies(zero, rw))
+  b0 = UOp.group(pro).barrier()
+  bp = UOp.group(*stage_stores(zero, 0, prefetch(zero), rw.after(b0), wq, aq, ws, ts)).barrier()
+  sbr = UOp.range(nsb, 3, AxisType.LOOP)
+  bufs = tuple(b.after(bp, sbr) for b in (rw, wq, aq, ws, ts))
+  cur = acc.after(sbr)
+  for h in range(2):
+    rwb, wqb, aqb, wsb, tsb = bufs
+    nsb_next, nh = (sbr, 1) if h == 0 else ((sbr+1).minimum(nsb-1), 0)
+    regs = prefetch(nsb_next*2+nh)
+    copies = raw_copies(nsb_next, rwb) if h == 1 else []
+    done = compute(wqb, aqb, wsb, tsb, cur, 10+h, copies)
+    # the barrier ending the compute hangs directly on the copies' wait (an AFTER would drop a void CUSTOM); the wait reads the
+    # accumulators, so it follows every shared read of this half
+    b1 = _cp_wait(*copies, done[0].load()).barrier() if copies else UOp.group(done).barrier()
+    nxt = tuple(b.after(b1) for b in bufs)
+    b2 = UOp.group(*stage_stores(nsb_next, nh, regs, *nxt)).barrier()
+    cur = done
+    bufs, cur = tuple(b.after(b2) for b in bufs), cur.after(b2)
+  acc = acc.after(b2.end(sbr))
+  outs = [out[tok0+tc+nt*8+2*t4+i%2, row0+wr+mt*16+g8+(i//2)*8].store(acc[(mt*NT+nt)*4+i].load())
+          for mt in range(MT) for nt in range(NT) for i in range(4)]
+  return UOp.group(*outs).end(token_block, row_block, lane, warp).sink(arg=KernelInfo(name="q6k_mmq", opts_to_apply=(), min_blocks=2))
+
+@functools.cache
+def _q4k_mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_features:int, in_features:int, live:UOp|None=None,
+                    TN:int=64, TM:int=128, small_tail:int|None=None, WR:int=2) -> UOp:
+  # Q4_K counterpart of _q6k_mmq_kernel: 144-byte super-blocks are 16-byte aligned, so cp.async copies them directly; the nibbles are
+  # unpacked per 128-weight half into a swizzled int8 tile; m16n8k32 MMAs, scale/min coefficients and token sums as in _mmq_kernel.
+  # 8 warps: WR row x 8//WR token warps of TN/WR rows x TM*WR/8 tokens.
+  WT = 8//WR
+  threads, nsb, MT, NT = 256, in_features//256, TN//(WR*16), TM//(WT*8)
+  n = None if live is None else live.unbind_all()[0]
+  token_block = UOp.range(tokens//TM if n is None else _live_blocks(n, TM, small_tail), 1, AxisType.GLOBAL)
+  row_block, lane = UOp.range(out_features//TN, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
+  warp = UOp.range(8, 2, AxisType.LOCAL)
+  tid, g8, t4 = warp*32+lane, lane//4, lane%4
+  row0, tok0, wr, tc = row_block*TN, token_block*TM, (warp//WT)*(TN//WR), (warp%WT)*(TM//WT)
+  wq = UOp.alloc((TN, 32), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  aq = UOp.alloc((TM, 32), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  ws = UOp.alloc((4, TN, 2), dtypes.float32, addrspace=AddrSpace.LOCAL)
+  ts = UOp.alloc((4, TM, 2), dtypes.float32, addrspace=AddrSpace.LOCAL)
+  rw = UOp.alloc((TN, 36), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  def items(n_items:int): return [(tid+i*threads).minimum(n_items-1) for i in range((n_items+threads-1)//threads)]
+  def word0(r:UOp, sb:UOp) -> UOp: return ((row0+r)*nsb+sb)*36  # first word of row r's super-block (raw is a uint32 view)
+  def raw_copies(sb:UOp, rwb:UOp) -> list[UOp]:
+    return [_cp_async(rwb[idx//9, idx%9*4], raw[word0(idx//9, sb)+idx%9*4], UOp.const(16, dtypes.int)) for idx in items(TN*9)]
+  def prefetch(stage:UOp) -> tuple[list, list]:
+    acts = [(it, _vload(xq, (tok0+it//8)*(in_features//4) + stage*32 + (it%8)*4, 4)) for it in items(TM*8)]
+    terms = []
+    for it in items(4*TM):
+      g, tk = stage*4+it//TM, tok0+it%TM
+      d = xd[g, tk].load()
+      terms.append((it, d, -(xs[g*2, tk].load()+xs[g*2+1, tk].load())*d))
+    return acts, terms
+  def stage_stores(sb:UOp, h:int, regs:tuple[list, list], rwb:UOp, wqb:UOp, aqb:UOp, wsb:UOp, tsb:UOp) -> list[UOp]:
+    acts, terms = regs
+    st = [aqb[it//8, ((it%8) ^ (it//8%8))*4+j].store(v[j]) for it, v in acts for j in range(4)]
+    st += [x for it, d, m in terms for x in (tsb[it//TM, it%TM, 0].store(d), tsb[it//TM, it%TM, 1].store(m))]
+    # unpack: item (row, 32-byte qs chunk of this half, 16-byte half of it): low nibbles are group 2*chunk, high ones 2*chunk+1
+    for it in items(TN*4):
+      r, ch, hcol = it//4, it//2%2, it%2
+      qs = [rwb[r, 4 + (h*2+ch)*8 + hcol*4 + j].load() for j in range(4)]
+      for nib in range(2):
+        grp = ch*2+nib
+        st += [wqb[r, ((grp*2+hcol) ^ (r%8))*4+j].store((q >> (nib*4)) & 0x0f0f0f0f) for j, q in enumerate(qs)]
+    # coefficients: item (group, row): d*scale and dmin*min of super-block group 4h+gi
+    for it in items(4*TN):
+      gi, rr = it//TN, it%TN
+      head, s0, s1, s2 = (rwb[rr, j].load() for j in range(4))
+      g = 4*h+gi
+      a, b, c = ((x >> ((g%4)*8).cast(dtypes.uint32)) & 255 for x in (s0, s1, s2))
+      low = g < 4
+      scale, mn = low.where(a & 63, (c & 15) | ((a >> 6) << 4)), low.where(b & 63, (c >> 4) | ((b >> 6) << 4))
+      st += [wsb[gi, rr, 0].store(_half(head & 0xffff)*scale.float()), wsb[gi, rr, 1].store(_half(head >> 16)*mn.float())]
+    return st
+  seed = UOp.stack(*(UOp.const(0x4b400000, dtypes.int32) for _ in range(4)))
+  def compute(wqb:UOp, aqb:UOp, wsb:UOp, tsb:UOp, cur:UOp, axis:int, copies:list[UOp]) -> UOp:
+    gi = UOp.range(4, axis, AxisType.LOOP)
+    c = cur.after(gi, *copies)  # the next super-block's copies are issued before this loop and overlap it
+    values = [c[i].load() for i in range(MT*NT*4)]
+    afr = [_ldm(wqb, (row:=wr+mt*16+lane%8+(lane//8%2)*8)*32 + ((gi*2+lane//16) ^ (row%8))*4, 4) for mt in range(MT)]
+    bfr = [_ldm(aqb, (tok:=tc+npair*16+lane%8+(lane//16)*8)*32 + ((gi*2+lane//8%2) ^ (tok%8))*4, 4) for npair in range(NT//2)]
+    co = [[wsb[gi, wr+(r//2)*16+g8+(r%2)*8, e].load() for e in range(2)] for r in range(2*MT)]
+    bias = [cc[0]*-MAGIC for cc in co]
+    for nt in range(NT):
+      tok = tc+nt*8+2*t4
+      tt = [[tsb[gi, tok+e, k].load() for k in range(2)] for e in range(2)]
+      b = UOp.stack(bfr[nt//2][(nt%2)*2], bfr[nt//2][(nt%2)*2+1]).bitcast(dtypes.int8)
+      for mt in range(MT):
+        dot = UOp.wmma(UOp.stack(*(afr[mt][j] for j in range(4))).bitcast(dtypes.int8), b, seed, (8,16,32), 32)
+        for i in range(4):
+          r, o = mt*2+i//2, (mt*NT+nt)*4+i
+          scaled = _fma(dot[i].bitcast(dtypes.float32), co[r][0], bias[r])
+          values[o] = _fma(scaled, tt[i%2][0], _fma(co[r][1], tt[i%2][1], values[o]))
+    return cur.after(c.store(UOp.stack(*values)).end(gi))
+  acc = UOp.alloc((MT*NT*4,), dtypes.float32, addrspace=AddrSpace.REG)
+  acc = acc.after(acc.store(acc.const_like(0)))
+  zero = UOp.const(0, dtypes.weakint)
+  b0 = _cp_wait(*raw_copies(zero, rw)).barrier()
+  bp = UOp.group(*stage_stores(zero, 0, prefetch(zero), rw.after(b0), wq, aq, ws, ts)).barrier()
+  sbr = UOp.range(nsb, 3, AxisType.LOOP)
+  bufs = tuple(b.after(bp, sbr) for b in (rw, wq, aq, ws, ts))
+  cur = acc.after(sbr)
+  for h in range(2):
+    rwb, wqb, aqb, wsb, tsb = bufs
+    nsb_next, nh = (sbr, 1) if h == 0 else ((sbr+1).minimum(nsb-1), 0)
+    regs = prefetch(nsb_next*2+nh)
+    copies = raw_copies(nsb_next, rwb) if h == 1 else []
+    done = compute(wqb, aqb, wsb, tsb, cur, 10+h, copies)
+    b1 = _cp_wait(*copies, done[0].load()).barrier() if copies else UOp.group(done).barrier()
+    nxt = tuple(b.after(b1) for b in bufs)
+    b2 = UOp.group(*stage_stores(nsb_next, nh, regs, *nxt)).barrier()
+    bufs, cur = tuple(b.after(b2) for b in bufs), done.after(b2)
+  acc = acc.after(b2.end(sbr))
+  outs = [out[tok0+tc+nt*8+2*t4+i%2, row0+wr+mt*16+g8+(i//2)*8].store(acc[(mt*NT+nt)*4+i].load())
+          for mt in range(MT) for nt in range(NT) for i in range(4)]
+  return UOp.group(*outs).end(token_block, row_block, lane, warp).sink(arg=KernelInfo(name="q4k_mmq", opts_to_apply=(), min_blocks=2))
 
 def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type:int, live:UOp|None=None) -> Tensor:
   # live: the symbolic token count of a chunk padded to its max size; the rows past it are left unwritten
@@ -335,9 +551,24 @@ def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type
   padded_tokens = (tokens+7)//8*8
   x = x.reshape(tokens, in_features).pad(((0, padded_tokens-tokens), (0, 0)))
   out = Tensor.empty(padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
-  fxn = functools.partial(_mmq_kernel, tokens=padded_tokens, out_features=out_features, in_features=in_features, ggml_type=ggml_type, live=live)
-  xq, xd, xs = q8_quantize(x, padded_tokens, in_features, live, group_major=ggml_type == Q4_K)
+  # Q6_K stages raw super-blocks with cp.async where its 64x128 tile divides the shape (two blocks per SM); other shapes share the
+  # register-staged kernel with Q4_K
+  v2 = ggml_type == Q6_K and out_features % 64 == 0 and padded_tokens % 128 == 0
+  fxn = functools.partial(_q6k_mmq_kernel, tokens=padded_tokens, out_features=out_features, in_features=in_features, live=live) if v2 else \
+        functools.partial(_mmq_kernel, tokens=padded_tokens, out_features=out_features, in_features=in_features, ggml_type=ggml_type, live=live)
+  xq, xd, xs = q8_quantize(x, padded_tokens, in_features, live, group_major=ggml_type == Q4_K or v2)
   if live is not None: xq = Tensor(xq.uop.after(live))
+  # a padded symbolic chunk whose live tokens end in a 1-64 token tail can run a 64-token-block cp.async kernel instead (no nearly empty
+  # 128-token block): 128 rows per block for Q4_K (4 row x 2 token warps: 1.5% faster than 2 x 4 here), 64 for Q6_K, whose raw tile is
+  # larger (two blocks per SM either way). Both kernels are
+  # launched, and the one that doesn't apply gets no blocks. A 64-token block costs ~0.56x a 128-token one for Q4_K, so its 2k+1 blocks
+  # win over k+1 for any chunk; ~0.6-0.65x for Q6_K, so only with at most one full block before the tail (live < 256)
+  tail = {Q4_K: (_q4k_mmq_kernel, 128, padded_tokens+1), Q6_K: (_q6k_mmq_kernel, 64, 256)}.get(ggml_type) \
+    if live is not None and padded_tokens % 128 == 0 else None
+  if tail is not None and out_features % tail[1] == 0:
+    out = Tensor.custom_kernel(out, weight, xq, xd, xs, fxn=functools.partial(fxn, small_tail=tail[2]))[0]
+    fxn = functools.partial(tail[0], tokens=padded_tokens, out_features=out_features, in_features=in_features, live=live, TN=tail[1], TM=64,
+                            small_tail=tail[2], **({"WR": 4} if ggml_type == Q4_K else {}))
   return Tensor.custom_kernel(out, weight, xq, xd, xs, fxn=fxn)[0][:tokens].reshape(*shape, out_features)
 
 # ******** prefill: flash attention ********
