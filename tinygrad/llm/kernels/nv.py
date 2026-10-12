@@ -97,17 +97,19 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int, cache:dict|None=None, up:
 
 # ******** decode: dp4a gemv ********
 
-def _gemv(out:UOp, tokens:int, out_features:int, in_features:int, lane_dot, name:str) -> UOp:
+def _gemv(out:UOp, tokens:int, out_features:int, in_features:int, lane_dot, name:str, res:tuple[UOp, ...]=()) -> UOp:
+  # res: a residual (tokens, out_features) added to the product in the store
   row_block, lane, warp = UOp.range(tokens*out_features//ROWS_PER_BLOCK, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP), \
     UOp.range(ROWS_PER_BLOCK, 2, AxisType.LOCAL)
   token_row = row_block*ROWS_PER_BLOCK + warp
   token, row = token_row//out_features, token_row%out_features
   acc = UOp.const(0, dtypes.float32)
   for step in range(in_features//1024): acc = acc + lane_dot(token, row, step*4 + lane//8, lane%8)
-  return out[token, row.valid(lane.eq(0))].store(warp_reduce(acc)).end(row_block, lane, warp).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+  val = warp_reduce(acc) + res[0][token, row].load() if res else warp_reduce(acc)
+  return out[token, row.valid(lane.eq(0))].store(val).end(row_block, lane, warp).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
-def _q4k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_features:int, in_features:int) -> UOp:
+def _q4k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *res:UOp, tokens:int, out_features:int, in_features:int) -> UOp:
   def lane_dot(token:UOp, row:UOp, block:UOp, t:UOp) -> UOp:
     # 16 qs bytes per lane: the low nibbles are sub-block 2j, the high nibbles 2j+1
     j, h = t//2, t%2
@@ -125,10 +127,10 @@ def _q4k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_f
     (sclo, mnlo), (schi, mnhi) = scale_min(((j%2)*16).cast(dtypes.uint32)), scale_min(((j%2)*16+8).cast(dtypes.uint32))
     xdlo, xdhi, xslo, xshi = xd[y//32, token].load(), xd[y//32+1, token].load(), xs[y//16, token].load(), xs[y//16+2, token].load()
     return _half(head & 0xffff) * (sclo*dlo.float()*xdlo + schi*dhi.float()*xdhi) - _half(head >> 16) * (mnlo*xslo*xdlo + mnhi*xshi*xdhi)
-  return _gemv(out, tokens, out_features, in_features, lane_dot, "q4k_gemv")
+  return _gemv(out, tokens, out_features, in_features, lane_dot, "q4k_gemv", res)
 
 @functools.cache
-def _q6k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_features:int, in_features:int) -> UOp:
+def _q6k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *res:UOp, tokens:int, out_features:int, in_features:int) -> UOp:
   def lane_dot(token:UOp, row:UOp, block:UOp, t:UOp) -> UOp:
     # 210-byte blocks are only halfword aligned. Lane t covers 16 ql bytes of half n, quarter c:
     # the low nibbles are y[128n+32c+l], the high nibbles y[128n+64+32c+l], qh adds bits 4-5
@@ -149,18 +151,20 @@ def _q6k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_f
     xdlo, xdhi, xslo, xshi = xd[y//32, token].load(), xd[y//32+2, token].load(), xs[y//16, token].load(), xs[y//16+4, token].load()
     # the -32 offset of the 6-bit quants is folded into the integer dot through the activation sums
     return _half(raw[base + 104].load()) * (sclo*(dlo.float() - 32*xslo)*xdlo + schi*(dhi.float() - 32*xshi)*xdhi)
-  return _gemv(out, tokens, out_features, in_features, lane_dot, "q6k_gemv")
+  return _gemv(out, tokens, out_features, in_features, lane_dot, "q6k_gemv", res)
 
 def nv_linear_supported(ggml_type:int|None, in_features:int, out_features:int) -> bool:
   return ggml_type in NV_QUANTS and in_features % 1024 == 0 and out_features % ROWS_PER_BLOCK == 0
 
 def nv_q8_linear(weight:Tensor, ggml_type:int, x:Tensor, in_features:int, out_features:int, q8:dict|None=None,
-                 up:Tensor|None=None) -> Tensor:
+                 up:Tensor|None=None, residual:Tensor|None=None) -> Tensor:
+  # residual: added to the product by the kernel's store
   tokens = int(x.numel()) // in_features
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_q4k_gemv_kernel if ggml_type == Q4_K else _q6k_gemv_kernel, tokens=tokens, out_features=out_features,
                           in_features=in_features)
-  return Tensor.custom_kernel(out, weight, *q8_quantize(x, tokens, in_features, q8, up), fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
+  res = () if residual is None else (residual.reshape(tokens, out_features).float().contiguous(),)
+  return Tensor.custom_kernel(out, weight, *q8_quantize(x, tokens, in_features, q8, up), *res, fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
 
 # ******** dense decode ********
 
@@ -588,11 +592,12 @@ def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type
 @functools.cache
 def _rmsnorm_q8_kernel(xq:UOp, xd:UOp, xs:UOp, *rest:UOp, n_parts:int, dim:int, eps:float, write_sum:bool, write_normed:bool) -> UOp:
   # one decode token: x = sum of the parts (the residual stream), its RMS norm with the weight, then the q8 quantization of
-  # q8_quantize (group-major scales and sums). One block of 8 warps; warp w owns 128-value chunks w, w+8, ...; the sum of squares
-  # reduces over each warp and then across the warps through shared memory.
+  # q8_quantize (group-major scales and sums). One block of up to 32 warps, warp w owns 128-value chunks w, w+32, ...; the sum of
+  # squares reduces over each warp and then across the warps through shared memory.
   outs = list(rest[:int(write_sum)+int(write_normed)])
   parts, weight = rest[len(outs):len(outs)+n_parts], rest[-1]
-  warps, chunks = 8, dim//128
+  chunks = dim//128
+  warps = min(chunks, 32)  # one warp per chunk: the kernel is latency bound (one token)
   lane, warp = UOp.range(32, -1, AxisType.WARP), UOp.range(warps, 1, AxisType.LOCAL)
   idx = [(warp + warps*c)*128 + lane*4 + i for c in range(chunks//warps) for i in range(4)]
   vals = [functools.reduce(UOp.__add__, (p[j].load() for p in parts)) for j in idx]

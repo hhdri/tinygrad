@@ -144,7 +144,8 @@ class FFNBlock:
       self.ffn_up      = Linear(config.dim, config.hidden_dim, bias=False)
       self.ffn_down    = Linear(config.hidden_dim, config.dim, bias=False)
 
-  def _feed_forward(self, x:Tensor, q8:dict|None=None) -> Tensor:
+  def _feed_forward(self, x:Tensor, q8:dict|None=None, residual:Tensor|None=None) -> Tensor:
+    # residual: added to the output (the dense FFN's down projection takes it into its decode GEMV)
     if hasattr(self, 'ffn_gate_exps'):
       h = x.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       logits = self.ffn_gate_inp(x)
@@ -172,9 +173,9 @@ class FFNBlock:
         shexp = self.ffn_down_shexp(silu_gate(self.ffn_gate_shexp(x)) * self.ffn_up_shexp(x))
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
-      return out
+      return out if residual is None else out + residual
     gate, up = Linear.project(x, self.ffn_gate, self.ffn_up, q8=q8)
-    return self.ffn_down.swiglu(gate, up)
+    return self.ffn_down.swiglu(gate, up, residual)
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
@@ -197,7 +198,7 @@ class FFNBlock:
          (w:=self.ffn_norm.weight) is not None and nv_rmsnorm_q8_supported(x, self.config.dim):
         h, _, q8 = nv_rmsnorm_q8([x, attn], w, self.ffn_norm.eps, write_sum=True)
         assert h is not None
-        return (h + self._feed_forward(self.ffn_norm(h), q8=q8)).contiguous()
+        return self._feed_forward(self.ffn_norm(h), q8=q8, residual=h).contiguous()
       h = x + attn
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)

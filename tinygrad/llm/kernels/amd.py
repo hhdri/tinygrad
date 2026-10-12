@@ -109,10 +109,12 @@ class Linear(nn.Linear):
     q8 = {} if q8 is None else q8
     return [l(x, q8) if isinstance(l, Linear) else l(x) for l in layers]
 
-  def swiglu(self, gate:Tensor, up:Tensor) -> Tensor:
-    # projects silu(gate)*up; NVIDIA's packed kernels form the product while quantizing it, so it is never written out
-    if self.use_custom_quant and nv_custom_kernels_supported(self.weight.device): return self._nv_call(gate, up=up)
-    return self(silu_gate(gate) * up)
+  def swiglu(self, gate:Tensor, up:Tensor, residual:Tensor|None=None) -> Tensor:
+    # projects silu(gate)*up (plus residual); NVIDIA's packed kernels form the product while quantizing it, so it is never written out,
+    # and the decode GEMV adds the residual in its store
+    if self.use_custom_quant and nv_custom_kernels_supported(self.weight.device): return self._nv_call(gate, up=up, residual=residual)
+    out = self(silu_gate(gate) * up)
+    return out if residual is None else out + residual
 
   def __call__(self, x:Tensor, q8:dict|None=None) -> Tensor:
     if self.use_custom_quant and nv_custom_kernels_supported(self.weight.device): return self._nv_call(x, q8)
@@ -136,7 +138,13 @@ class Linear(nn.Linear):
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return super().__call__(x)
 
-  def _nv_call(self, x:Tensor, q8:dict|None=None, up:Tensor|None=None) -> Tensor:
+  def _nv_call(self, x:Tensor, q8:dict|None=None, up:Tensor|None=None, residual:Tensor|None=None) -> Tensor:
+    out = self._nv_project(x, q8, up, residual if self.bias is None else None)
+    return out if residual is None or self.bias is None else out + residual
+
+  def _nv_project(self, x:Tensor, q8:dict|None=None, up:Tensor|None=None, residual:Tensor|None=None) -> Tensor:
+    # residual: only the packed decode GEMV takes it into its store, every other path adds it
+    def add(out:Tensor) -> Tensor: return out if residual is None else out + residual
     if self.ggml_type is None:
       # keep the lazy dequantization for the shapes the packed kernels don't cover
       self.dense = self.weight
@@ -152,10 +160,10 @@ class Linear(nn.Linear):
         # prefill: F16 activations with F32 accumulation run on tensor cores; F32 activations would promote the weight to F32.
         # contiguous() turns the uint8 GGUF view into a zero-copy F16 buffer view: through the bitcast the matmul loaded bytes.
         else: out = x.cast(dtypes.float16).matmul(weight.contiguous().T, dtype=dtypes.float32)
-        return out if self.bias is None else out + self.bias
+        return add(out if self.bias is None else out + self.bias)
       if not nv_linear_supported(self.ggml_type, self.in_features, self.out_features):
         self.use_custom_quant, self.weight, self.ggml_type = False, self.dense, None
-        return super().__call__(x if up is None else silu_gate(x) * up)
+        return add(super().__call__(x if up is None else silu_gate(x) * up))
     assert self.ggml_type is not None
     numel = x.numel()
     if prod(x.max_shape) > self.in_features and self.out_features % 16 == 0 and nv_mmq_supported(self.weight.device):
@@ -163,10 +171,10 @@ class Linear(nn.Linear):
                    self.in_features, self.out_features, self.ggml_type, None if isinstance(numel, int) else numel//self.in_features, q8,
                    up if up is None or isinstance(numel, int) else _pad_to_max(up))
       if not isinstance(numel, int): out = out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
-      return out if self.bias is None else out + self.bias
+      return add(out if self.bias is None else out + self.bias)
     if not isinstance(numel, int) or numel != self.in_features:
-      return (x if up is None else silu_gate(x) * up).linear(self.dense.T, self.bias)
-    out = nv_q8_linear(self.weight, self.ggml_type, x, self.in_features, self.out_features, q8, up)
+      return add((x if up is None else silu_gate(x) * up).linear(self.dense.T, self.bias))
+    out = nv_q8_linear(self.weight, self.ggml_type, x, self.in_features, self.out_features, q8, up, residual)
     return out if self.bias is None else out + self.bias
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
