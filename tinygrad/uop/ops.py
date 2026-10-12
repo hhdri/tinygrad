@@ -187,10 +187,13 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType:
 
 class UOpMetaClass(type):
   ucache:dict[tuple, weakref.ReferenceType[UOp]] = {}
+  created_count = itertools.count()
   def __call__(cls, op:Ops, src:tuple[UOp,...]=tuple(), arg:Any=None, tag:Any=None, metadata:tuple[Metadata,...]|None=None):
     # NOTE: the key must separate nodes of different dtype: a CONST's dtype is the type of its arg, and True == 1 as dict keys
     if (wret:=UOpMetaClass.ucache.get(key:=(op, src, arg, tag, type(arg)), None)) is not None and (ret:=wret()) is not None: return ret
     UOpMetaClass.ucache[key] = weakref.ref(created:=super().__call__(op, src, arg, tag))
+    # creation order: srcs exist before the UOp, so a graph only holds UOps created no later than its root
+    created.__dict__["_created"] = next(UOpMetaClass.created_count)
     if metadata is not None: all_metadata[created] = metadata
     if SPEC > 1:
       from tinygrad.uop.spec import spec_full
@@ -594,6 +597,8 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     return UOp(Ops.STORE, src=srcs, **kwargs)
   def end(self, *src:UOp): return UOp(Ops.END, src=(self,)+src) if len(src) else self
   def backedge(self, loop:UOp, cond:UOp): return UOp(Ops.BACKEDGE, src=(self, loop, cond))
+  @property
+  def created(self) -> int: return self.__dict__["_created"]  # creation order (UOpMetaClass): a UOp's srcs were created before it
   def after(self, *src:UOp, **kwargs): return UOp(Ops.AFTER, src=(self,)+src, **kwargs) if len(src) else self
   @property
   def without_after(self) -> UOp: return self.src[0].without_after if self.op is Ops.AFTER else self

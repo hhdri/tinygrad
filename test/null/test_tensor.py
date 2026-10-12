@@ -116,6 +116,27 @@ class TestIdxUpcast(unittest.TestCase):
     a = Tensor.empty(2**11, 2**11, 1, dtype=dtypes.int8).permute((2, 0, 1)).expand((2**9+10, -1, -1)).contiguous()
     a.realize()
 
+class TestRealizeScope(unittest.TestCase):
+  def test_older_tensors_unwalked(self):
+    # a graph only holds UOps created before its root, so realizing new UOps doesn't walk tensors older than them
+    from unittest.mock import patch
+    old = [Tensor.empty(4) + i for i in range(10)]
+    a = Tensor.empty(4) * 3
+    b = a + 1  # newer than a: must see a's buffer
+    walked: list[UOp] = []
+    orig = UOp.topovisit
+    def topovisit(self, visitor, cache):
+      walked.append(self)
+      return orig(self, visitor, cache)
+    with patch.object(UOp, "topovisit", topovisit): a.realize()
+    self.assertFalse(any(t.uop in walked for t in old))
+    self.assertIn(a.uop.base, b.uop.toposort())
+
+  def test_created_order(self):
+    x = Tensor.empty(4).uop
+    y = x + 1
+    self.assertTrue(all(s.created < y.created for s in y.src))
+
 class TestTensorUnique(unittest.TestCase):
   def test_empty_bufs_unique(self):
     a = Tensor.empty(10, 10).contiguous()
