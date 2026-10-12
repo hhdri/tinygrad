@@ -1,5 +1,5 @@
 from __future__ import annotations
-import functools, math
+import functools, math, itertools
 from tinygrad import Tensor, UOp, Device, Context, dtypes
 from tinygrad.helpers import getenv, prod
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, AddrSpace
@@ -130,12 +130,14 @@ def _q4k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *res:UOp, tokens:
   return _gemv(out, tokens, out_features, in_features, lane_dot, "q4k_gemv", res)
 
 @functools.cache
-def _q4k_multi_gemv_kernel(*bufs:UOp, n:int, rows:tuple[int, ...], in_features:int) -> UOp:
-  # several Q4_K projections of one token in one launch (bufs: n outputs, n packed weights, xq, xd, xs): rows are numbered across
-  # the matrices, each warp takes one row and reads its matrix through gated loads (the other matrices' loads are predicated off)
-  outs, raws, (xq, xd, xs) = bufs[:n], bufs[n:2*n], bufs[2*n:]
+def _q4k_multi_gemv_kernel(*bufs:UOp, n:int, rows:tuple[int, ...], in_features:int, f16_rows:int=0) -> UOp:
+  # several Q4_K projections of one token in one launch (bufs: the output of all their rows, n packed weights, xq, xd, xs): rows
+  # are numbered across the matrices, each warp takes one row and reads its matrix through gated loads (the other matrices' loads
+  # are predicated off). f16_rows: an F16 projection of the same token appended after them (its weight and the float input last)
+  out, raws, (xq, xd, xs) = bufs[0], bufs[1:1+n], bufs[1+n:4+n]
   starts = [sum(rows[:m]) for m in range(n)]
-  def sel(row:UOp, m:int) -> UOp: return (row >= starts[m]) & (row < starts[m] + rows[m]) if n > 1 else UOp.const(True, dtypes.bool)
+  qrows = sum(rows)
+  def sel(row:UOp, m:int) -> UOp: return (row >= starts[m]) & (row < starts[m] + rows[m]) if n > 1 or f16_rows else UOp.const(True, dtypes.bool)
   def lane_dot(token:UOp, row:UOp, block:UOp, t:UOp) -> UOp:
     j, h = t//2, t%2
     def words(off:int, cnt:int) -> list[UOp]:
@@ -156,23 +158,35 @@ def _q4k_multi_gemv_kernel(*bufs:UOp, n:int, rows:tuple[int, ...], in_features:i
     (sclo, mnlo), (schi, mnhi) = scale_min(((j%2)*16).cast(dtypes.uint32)), scale_min(((j%2)*16+8).cast(dtypes.uint32))
     xdlo, xdhi, xslo, xshi = xd[y//32, token].load(), xd[y//32+1, token].load(), xs[y//16, token].load(), xs[y//16+2, token].load()
     return _half(head & 0xffff) * (sclo*dlo.float()*xdlo + schi*dhi.float()*xdhi) - _half(head >> 16) * (mnlo*xslo*xdlo + mnhi*xshi*xdhi)
-  total = sum(rows)
+  total = qrows + f16_rows
   row_block, lane, warp = UOp.range(total//ROWS_PER_BLOCK, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP), \
     UOp.range(ROWS_PER_BLOCK, 2, AxisType.LOCAL)
   row = row_block*ROWS_PER_BLOCK + warp
   token = UOp.const(0, dtypes.weakint)
   acc = UOp.const(0, dtypes.float32)
   for step in range(in_features//1024): acc = acc + lane_dot(token, row, step*4 + lane//8, lane%8)
+  stores = []
+  if f16_rows:
+    fw, xf = bufs[4+n:]
+    is_f, frow = row >= qrows, row - qrows
+    for step in range(in_features//256):
+      idx = step*256 + lane*8
+      for j in range(8): acc = acc + fw[(frow*in_features + idx + j).valid(is_f)].load().float()*xf[idx + j].load().float()
   val = warp_reduce(acc)
-  stores = [outs[m][0, (row-starts[m]).valid(sel(row, m) & lane.eq(0))].store(val) for m in range(n)]
+  stores.append(out[0, row.valid(lane.eq(0))].store(val))
   return UOp.group(*stores).end(row_block, lane, warp).sink(arg=KernelInfo(name="q4k_gemv", opts_to_apply=()))
 
-def nv_q8_multi_linear(weights:list[Tensor], x:Tensor, in_features:int, out_features:list[int], q8:dict|None=None) -> list[Tensor]:
-  # one decode token through several packed Q4_K weights in one launch (see _q4k_multi_gemv_kernel)
-  outs = [Tensor.empty(1, o, dtype=dtypes.float32, device=x.device) for o in out_features]
-  fxn = functools.partial(_q4k_multi_gemv_kernel, n=len(weights), rows=tuple(out_features), in_features=in_features)
-  res = Tensor.custom_kernel(*outs, *weights, *q8_quantize(x, 1, in_features, q8), fxn=fxn)[:len(weights)]
-  return [r.reshape(*x.shape[:-1], o) for r, o in zip(res, out_features)]
+def nv_q8_multi_linear(weights:list[Tensor], x:Tensor, in_features:int, out_features:list[int], q8:dict|None=None,
+                       f16:tuple[Tensor, int]|None=None) -> list[Tensor]:
+  # one decode token through several packed Q4_K weights (and optionally one F16 weight, its output last) in one launch, written
+  # into one buffer of all their rows
+  sizes = out_features + ([] if f16 is None else [f16[1]])
+  out = Tensor.empty(1, sum(sizes), dtype=dtypes.float32, device=x.device)
+  extra = () if f16 is None else (f16[0].contiguous(), x.reshape(-1).contiguous())
+  fxn = functools.partial(_q4k_multi_gemv_kernel, n=len(weights), rows=tuple(out_features), in_features=in_features,
+                          f16_rows=0 if f16 is None else f16[1])
+  out = Tensor.custom_kernel(out, *weights, *q8_quantize(x, 1, in_features, q8), *extra, fxn=fxn)[0]
+  return [out[:, st:st+o].reshape(*x.shape[:-1], o) for st, o in zip(itertools.accumulate([0]+sizes), sizes)]
 
 @functools.cache
 def _q6k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *res:UOp, tokens:int, out_features:int, in_features:int) -> UOp:

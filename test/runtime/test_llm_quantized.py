@@ -3,7 +3,7 @@ import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid, flash_attention
 from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq, nv_flash_attention, nv_mmq_supported, nv_qk_prep, nv_rmsnorm_q8, \
-  nv_flash_decode_q8, nv_f16_gemm, nv_q8_multi_linear, nv_q8_linear
+  nv_flash_decode_q8, nv_f16_gemm, nv_q8_multi_linear, nv_q8_linear, nv_f16_gemv
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
@@ -263,6 +263,11 @@ class TestNVQuantLinear(unittest.TestCase):
     x = Tensor(rng.normal(size=(1, 1, K)).astype(np.float32)).realize()
     got = nv_q8_multi_linear([w for w, _ in ws], x, K, [N for _, N in ws])
     for (w, N), g in zip(ws, got): np.testing.assert_equal(g.numpy(), nv_q8_linear(w, 12, x, K, N).numpy())
+    # with an F16 projection appended (attn_v next to q and k)
+    wf = Tensor(rng.normal(size=(64, K)).astype(np.float16)*0.05).realize()
+    got = nv_q8_multi_linear([w for w, _ in ws], x, K, [N for _, N in ws], f16=(wf, 64))
+    for (w, N), g in zip(ws, got[:-1]): np.testing.assert_equal(g.numpy(), nv_q8_linear(w, 12, x, K, N).numpy())
+    np.testing.assert_allclose(got[-1].numpy(), nv_f16_gemv(wf, x, K, 64).numpy(), atol=1e-5, rtol=1e-5)
 
   def test_swiglu(self):
     # silu(gate)*up quantized inside the q8 kernel vs the product as an ordinary input: decode, static and symbolic prefill (gate and up

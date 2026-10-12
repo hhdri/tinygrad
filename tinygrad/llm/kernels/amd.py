@@ -102,9 +102,11 @@ class Linear(nn.Linear):
     # and in decode the packed Q4_K ones share one GEMV launch
     q8 = {} if q8 is None else q8
     packed = [l for l in layers if isinstance(l, Linear) and l._nv_packed_decode(x) and l.ggml_type == Q4_K]
-    if len(packed) < 2: return [l(x, q8) if isinstance(l, Linear) else l(x) for l in layers]
-    multi = nv_q8_multi_linear([l.weight for l in packed], x, packed[0].in_features, [l.out_features for l in packed], q8)
-    outs: dict[nn.Linear, Tensor] = dict(zip(packed, multi))
+    dense = [(l, w) for l in layers if l not in packed and isinstance(l, Linear) and (w:=l._nv_dense_decode(x)) is not None][:1]
+    if len(packed) + len(dense) < 2 or not packed: return [l(x, q8) if isinstance(l, Linear) else l(x) for l in layers]
+    multi = nv_q8_multi_linear([l.weight for l in packed], x, packed[0].in_features, [l.out_features for l in packed], q8,
+                               (dense[0][1], dense[0][0].out_features) if dense else None)
+    outs: dict[nn.Linear, Tensor] = dict(zip(packed + [l for l, _ in dense], multi))
     return [outs[l] if l in outs else l(x, q8) if isinstance(l, Linear) else l(x) for l in layers]
 
   def _nv_packed_decode(self, x:Tensor) -> bool:
@@ -118,6 +120,15 @@ class Linear(nn.Linear):
       if typ is not None and not nv_linear_supported(typ, self.in_features, self.out_features):
         self.use_custom_quant, self.weight, self.ggml_type = False, self.dense, None
     return self.use_custom_quant and self.ggml_type is not None
+
+  def _nv_dense_decode(self, x:Tensor) -> Tensor|None:
+    # NVIDIA: the F16 weight a dense projection of one token would read (the F16 GEMV path of _nv_project), else None
+    if not (self.use_custom_quant and nv_custom_kernels_supported(self.weight.device)) or self.bias is not None: return None
+    if not isinstance(numel:=x.numel(), int) or numel != self.in_features or self.ggml_type is not None: return None
+    weight = _view_back(self.weight)
+    if weight.dtype == dtypes.float16 and weight.uop.contiguous_view() is not None and self.weight.uop.axis is None and \
+       self.in_features % 256 == 0 and self.out_features % 4 == 0: return weight
+    return None
 
   def swiglu(self, gate:Tensor, up:Tensor, residual:Tensor|None=None) -> Tensor:
     # projects silu(gate)*up (plus residual); NVIDIA's packed kernels form the product while quantizing it, so it is never written out,
