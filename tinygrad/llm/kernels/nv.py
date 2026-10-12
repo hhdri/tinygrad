@@ -130,6 +130,51 @@ def _q4k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *res:UOp, tokens:
   return _gemv(out, tokens, out_features, in_features, lane_dot, "q4k_gemv", res)
 
 @functools.cache
+def _q4k_multi_gemv_kernel(*bufs:UOp, n:int, rows:tuple[int, ...], in_features:int) -> UOp:
+  # several Q4_K projections of one token in one launch (bufs: n outputs, n packed weights, xq, xd, xs): rows are numbered across
+  # the matrices, each warp takes one row and reads its matrix through gated loads (the other matrices' loads are predicated off)
+  outs, raws, (xq, xd, xs) = bufs[:n], bufs[n:2*n], bufs[2*n:]
+  starts = [sum(rows[:m]) for m in range(n)]
+  def sel(row:UOp, m:int) -> UOp: return (row >= starts[m]) & (row < starts[m] + rows[m]) if n > 1 else UOp.const(True, dtypes.bool)
+  def lane_dot(token:UOp, row:UOp, block:UOp, t:UOp) -> UOp:
+    j, h = t//2, t%2
+    def words(off:int, cnt:int) -> list[UOp]:
+      vals = [[raws[m][(((row-starts[m])*(in_features//256) + block)*36 + off + i).valid(sel(row, m))].load() for i in range(cnt)]
+              for m in range(n)]
+      return [functools.reduce(lambda acc, m: sel(row, m).where(vals[m][i], acc), range(n-2, -1, -1), vals[n-1][i]) for i in range(cnt)]
+    head, s0, s1, s2 = words(0, 4)
+    qv = [[raws[m][(((row-starts[m])*(in_features//256) + block)*36 + 4 + j*8 + h*4 + i).valid(sel(row, m))].load() for i in range(4)]
+          for m in range(n)]
+    qs = [functools.reduce(lambda acc, m: sel(row, m).where(qv[m][i], acc), range(n-2, -1, -1), qv[n-1][i]) for i in range(4)]
+    y = block*256 + j*64 + h*16
+    xlo, xhi = _vload(xq, token*xq.shape[1] + y//4, 4), _vload(xq, token*xq.shape[1] + (y+32)//4, 4)
+    dlo = dhi = UOp.const(0, dtypes.int32)
+    for i in range(4): dlo, dhi = _dp4a(qs[i] & 0x0f0f0f0f, xlo[i], dlo), _dp4a((qs[i] >> 4) & 0x0f0f0f0f, xhi[i], dhi)
+    def scale_min(shift:UOp) -> tuple[UOp, UOp]:
+      a, b, c = (s0 >> shift) & 255, (s1 >> shift) & 255, (s2 >> shift) & 255
+      return (j < 2).where(a & 63, (c & 15) | ((a >> 6) << 4)).float(), (j < 2).where(b & 63, (c >> 4) | ((b >> 6) << 4)).float()
+    (sclo, mnlo), (schi, mnhi) = scale_min(((j%2)*16).cast(dtypes.uint32)), scale_min(((j%2)*16+8).cast(dtypes.uint32))
+    xdlo, xdhi, xslo, xshi = xd[y//32, token].load(), xd[y//32+1, token].load(), xs[y//16, token].load(), xs[y//16+2, token].load()
+    return _half(head & 0xffff) * (sclo*dlo.float()*xdlo + schi*dhi.float()*xdhi) - _half(head >> 16) * (mnlo*xslo*xdlo + mnhi*xshi*xdhi)
+  total = sum(rows)
+  row_block, lane, warp = UOp.range(total//ROWS_PER_BLOCK, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP), \
+    UOp.range(ROWS_PER_BLOCK, 2, AxisType.LOCAL)
+  row = row_block*ROWS_PER_BLOCK + warp
+  token = UOp.const(0, dtypes.weakint)
+  acc = UOp.const(0, dtypes.float32)
+  for step in range(in_features//1024): acc = acc + lane_dot(token, row, step*4 + lane//8, lane%8)
+  val = warp_reduce(acc)
+  stores = [outs[m][0, (row-starts[m]).valid(sel(row, m) & lane.eq(0))].store(val) for m in range(n)]
+  return UOp.group(*stores).end(row_block, lane, warp).sink(arg=KernelInfo(name="q4k_gemv", opts_to_apply=()))
+
+def nv_q8_multi_linear(weights:list[Tensor], x:Tensor, in_features:int, out_features:list[int], q8:dict|None=None) -> list[Tensor]:
+  # one decode token through several packed Q4_K weights in one launch (see _q4k_multi_gemv_kernel)
+  outs = [Tensor.empty(1, o, dtype=dtypes.float32, device=x.device) for o in out_features]
+  fxn = functools.partial(_q4k_multi_gemv_kernel, n=len(weights), rows=tuple(out_features), in_features=in_features)
+  res = Tensor.custom_kernel(*outs, *weights, *q8_quantize(x, 1, in_features, q8), fxn=fxn)[:len(weights)]
+  return [r.reshape(*x.shape[:-1], o) for r, o in zip(res, out_features)]
+
+@functools.cache
 def _q6k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *res:UOp, tokens:int, out_features:int, in_features:int) -> UOp:
   def lane_dot(token:UOp, row:UOp, block:UOp, t:UOp) -> UOp:
     # 210-byte blocks are only halfword aligned. Lane t covers 16 ql bytes of half n, quarter c:

@@ -8,7 +8,7 @@ from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
 from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv, nv_mmq, nv_mmq_supported, \
-  pad_to_max, nv_f16_gemm, nv_f16_gemm_supported
+  pad_to_max, nv_f16_gemm, nv_f16_gemm_supported, nv_q8_multi_linear
 from tinygrad.llm.kernels.nv import warp_reduce as nv_warp_reduce
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
@@ -98,9 +98,26 @@ class Linear(nn.Linear):
     self.weight = Tensor(raw).flatten().bitcast(word_dtype).contiguous()
   @staticmethod
   def project(x:Tensor, *layers:nn.Linear, q8:dict|None=None) -> list[Tensor]:
-    # projections of one input: on NVIDIA its q8 quantization is shared, so it runs once (q8: already quantized, e.g. with the norm)
+    # projections of one input: on NVIDIA its q8 quantization is shared, so it runs once (q8: already quantized, e.g. with the norm),
+    # and in decode the packed Q4_K ones share one GEMV launch
     q8 = {} if q8 is None else q8
-    return [l(x, q8) if isinstance(l, Linear) else l(x) for l in layers]
+    packed = [l for l in layers if isinstance(l, Linear) and l._nv_packed_decode(x) and l.ggml_type == Q4_K]
+    if len(packed) < 2: return [l(x, q8) if isinstance(l, Linear) else l(x) for l in layers]
+    multi = nv_q8_multi_linear([l.weight for l in packed], x, packed[0].in_features, [l.out_features for l in packed], q8)
+    outs: dict[nn.Linear, Tensor] = dict(zip(packed, multi))
+    return [outs[l] if l in outs else l(x, q8) if isinstance(l, Linear) else l(x) for l in layers]
+
+  def _nv_packed_decode(self, x:Tensor) -> bool:
+    # NVIDIA: whether one token goes through the packed decode GEMV (sets up the packed weight on first use, as _nv_project does)
+    if not (self.use_custom_quant and nv_custom_kernels_supported(self.weight.device)) or self.bias is not None: return False
+    if not isinstance(numel:=x.numel(), int) or numel != self.in_features: return False
+    if self.ggml_type is None and not hasattr(self, "dense"):
+      self.dense = self.weight
+      if isinstance(self.weight.device, str): self.set_quantized(self.weight, (Q4_K, Q6_K))
+      typ = cast(int|None, getattr(self, "ggml_type"))  # set by set_quantized
+      if typ is not None and not nv_linear_supported(typ, self.in_features, self.out_features):
+        self.use_custom_quant, self.weight, self.ggml_type = False, self.dense, None
+    return self.use_custom_quant and self.ggml_type is not None
 
   def swiglu(self, gate:Tensor, up:Tensor, residual:Tensor|None=None) -> Tensor:
     # projects silu(gate)*up (plus residual); NVIDIA's packed kernels form the product while quantizing it, so it is never written out,
