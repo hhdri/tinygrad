@@ -46,8 +46,10 @@ class CUDAQueue(HWQueue):
     size = max([o + w.dtype.itemsize for o, w in rows], default=8) - 8
     addr = UOp(Ops.LINEAR, src=tuple(pack_args([(0, UOp.const(size, dtypes.uint64))] + rows, 8 + size)), arg="kernargs").getaddr(self.devs)
     # extra: [buffer pointer, &args, buffer size, &size, end]
-    self.call(cuda.cuLaunchKernel, self.extern((self.dev.tag("function"), obj.lib, obj.name)), *prg.arg.global_size, *prg.arg.local_size, 0, None, 0,
-              (self.q(*[UOp.const(v, dtypes.uint64) if isinstance(v, int) else v for v in (1, addr + 8, 2, addr, 0)]) - 40,))
+    # kernels above the static limit keep their LOCAL buffers in dynamic shared memory (see CUDARenderer)
+    dyn = prg.arg.shared_mem if prg.arg.shared_mem > CUDARenderer.max_static_shared else 0
+    self.call(cuda.cuLaunchKernel, self.extern((self.dev.tag("function"), obj.lib, obj.name, dyn)), *prg.arg.global_size, *prg.arg.local_size,
+              dyn, None, 0, (self.q(*[UOp.const(v, dtypes.uint64) if isinstance(v, int) else v for v in (1, addr + 8, 2, addr, 0)]) - 40,))
 
   def copy(self, dst:UOp, src:UOp, sz:int): self.call(cuda.cuMemcpyAsync, dst.getaddr(self.devs), src.getaddr(self.devs), sz, None)
   def wait(self, sig:UOp, val:UOp): self.call(cuda.cuStreamWaitValue64_v2, None, sig.getaddr(self.devs), val, cuda.CU_STREAM_WAIT_VALUE_GEQ)
@@ -113,11 +115,12 @@ class CUDADevice(Compiled):
   def stamp(self) -> Buffer: return extern(as_int(fn:=cuda.CUhostFn(host_stamp)), fn)
 
   @functools.cache
-  def function(self, lib:bytes, name:str) -> Buffer:
+  def function(self, lib:bytes, name:str, dyn_shared:int=0) -> Buffer:
     if DEBUG >= 5: print("\n".join([f"{i+1:>3} {line}" for i, line in enumerate(pretty_ptx(lib.decode()).split("\n"))]))
     check(cuda.cuCtxSetCurrent(self.context))
     check(cuda.cuModuleLoadData(ctypes.byref(module:=cuda.CUmodule()), lib))
     check(cuda.cuModuleGetFunction(ctypes.byref(func:=cuda.CUfunction()), module, name.encode()))
+    if dyn_shared: check(cuda.cuFuncSetAttribute(func, cuda.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dyn_shared))
     return extern(as_int(func))
 
   def count(self) -> int: return init_c_var(ctypes.c_int, lambda x: check(cuda.cuDeviceGetCount(ctypes.byref(x)))).value
