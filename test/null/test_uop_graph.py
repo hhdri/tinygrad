@@ -432,6 +432,14 @@ class TestUOpGraph(unittest.TestCase):
     a = c.after(e)
     self.assertNotIn(r, a.ranges)
 
+  def test_after_keeps_void_custom(self):
+    # a void CUSTOM (e.g. inline asm like cp.async) is a side effect: an AFTER waits on it, while a value dep is replaced by its srcs
+    buf = UOp.param(0, dtypes.int, 4)
+    asm = UOp(Ops.CUSTOM, (buf.index(UOp.const(0)),), ('asm volatile("" :: "l"({0}));', dtypes.void))
+    val = UOp(Ops.CUSTOM, (), ("0", dtypes.int))
+    self.assertIs(buf.after(asm, val).simplify(), buf.after(asm))
+    self.assertIs(buf.after(val).simplify(), buf)
+
   def test_external_call_preserves_ranges(self):
     r = UOp.range(4, 0, dtype=dtypes.int)
     fn = UOp.custom_function("external", dtype=dtypes.int)
