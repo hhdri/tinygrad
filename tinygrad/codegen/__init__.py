@@ -122,11 +122,12 @@ def do_devectorize(b:UOp):
   return UOp.stack(*src).reshape(b.shape) if b.op is not Ops.STORE else UOp.group(*src)
 
 def do_stack_wmma(u:UOp):
-  if all(x.op in (Ops.STACK, Ops.WMMA) for x in u.src): return None
+  # a shape-changing BITCAST (e.g. packed words to int8 fragments) is already a whole fragment
+  if all(x.op in (Ops.STACK, Ops.WMMA) or is_shape_changing_bitcast(x) for x in u.src): return None
   assert len(u.shape) == 1
   src = []
   for b in u.src:
-    if b.op != Ops.STACK:
+    if b.op != Ops.STACK and not is_shape_changing_bitcast(b):
       src.append(UOp.stack(*[b.index(i) for i in range(b.max_numel())]))
     else:
       src.append(b)

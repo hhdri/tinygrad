@@ -5,11 +5,13 @@ from tinygrad import Tensor, UOp, Device
 from tinygrad.nn.state import get_state_dict
 from tinygrad.schedule import schedule_cache
 from tinygrad.llm.model import Transformer, TransformerConfig
+from tinygrad.llm.kernels.nv import nv_mmq_supported
 
 TEST_CONFIG = TransformerConfig(num_blocks=1, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2,
                            norm_eps=1e-5, vocab_size=100, head_dim=32, rope_theta=10000.0, rope_dim=32, v_head_dim=32, max_context=32)
 V_START_POS = UOp.variable("start_pos", 0, TEST_CONFIG.max_context-1)
-V_TOKS = UOp.variable("toks", 1, 32)  # 32 is the default chunk_size in generate
+# generate's default chunk_size: 512 where the NV prefill kernels run, else 32
+V_TOKS = UOp.variable("toks", 1, 512 if nv_mmq_supported(Device.DEFAULT) else 32)
 
 class TestTransformerGenerate(unittest.TestCase):
   def test_warmup_then_generate_with_default_chunk(self):
