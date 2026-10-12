@@ -2,7 +2,7 @@ import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid, flash_attention
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq, nv_flash_attention, nv_mmq_supported
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq, nv_flash_attention, nv_mmq_supported, nv_qk_prep
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
@@ -161,6 +161,28 @@ class TestNVQuantLinear(unittest.TestCase):
           # a lazy input is written into an uninitialized max-size buffer (live rows only) instead of passed on as a buffer slice
           actual = function(lambda x: layer(x*2), allow_implicit=True)(inp)[:tokens].numpy()
           np.testing.assert_allclose(actual,layer(Tensor(x*2)).numpy(),atol=4e-4,rtol=2e-4)
+
+  def test_qk_prep(self):
+    # the decode attention prologue kernel vs the generic path: per-head RMS norm with weights, rotary embedding, KV cache write
+    from tinygrad.llm.model import apply_rope, precompute_freqs_cis
+    rng = np.random.default_rng(3)
+    H, HKV, D, N, eps = 8, 2, 128, 64, 1e-6
+    q, k, v = (Tensor(rng.normal(size=(1, 1, h*D)).astype(np.float32)).realize() for h in (H, HKV, HKV))
+    qw, kw = (Tensor(rng.normal(size=(D,)).astype(np.float32)).realize() for _ in range(2))
+    freqs = precompute_freqs_cis(D, N, 1e6).realize()
+    for sp in (0, 5, N-1):
+      with self.subTest(start_pos=sp):
+        cache = Tensor(rng.normal(size=(2, 1, HKV, N, D)).astype(np.float16)).realize()
+        before = cache.numpy()
+        start = UOp.variable("start_pos", 0, N-1).bind(sp)
+        qh, kv = nv_qk_prep(q, k, v, qw, kw, freqs, cache, start, H, HKV, D, eps)
+        Tensor.realize(qh, kv)  # together: realizing one output of a multi-output custom kernel leaves the other to run it again
+        def ref(x, h, w): return apply_rope((x.reshape(1, 1, h, D).float().rmsnorm(eps=eps)*w).transpose(1, 2), freqs[sp:sp+1])
+        np.testing.assert_allclose(qh.float().numpy(), ref(q, H, qw).half().float().numpy(), atol=2e-3, rtol=2e-3)
+        got, want = kv.numpy(), before.copy()
+        want[0, 0, :, sp] = ref(k, HKV, kw).half().numpy()[0, :, 0]
+        want[1, 0, :, sp] = v.reshape(HKV, D).half().numpy()
+        np.testing.assert_allclose(got.astype(np.float32), want.astype(np.float32), atol=2e-3, rtol=2e-3)
 
   def test_swiglu(self):
     # silu(gate)*up quantized inside the q8 kernel vs the product as an ordinary input: decode, static and symbolic prefill (gate and up

@@ -581,6 +581,51 @@ def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type
                             small_tail=tail[2])
   return Tensor.custom_kernel(out, weight, xq, xd, xs, fxn=fxn)[0][:tokens].reshape(*shape, out_features)
 
+# ******** decode: attention prologue ********
+
+@functools.cache
+def _qk_prep_kernel(q_out:UOp, cache:UOp, q:UOp, k:UOp, v:UOp, q_norm:UOp, k_norm:UOp, freqs:UOp, start_pos:UOp,
+                    heads:int, kv_heads:int, head_dim:int, eps:float) -> UOp:
+  # one decode token's attention prologue, one warp per head row (rows < heads are queries, the rest keys): RMS norm over the head
+  # with its weight, rotary embedding (element i pairs with i + D/2, which is 16 lanes away), then q goes out as half and the key and
+  # its value row into the KV cache at start_pos. Replaces the norm reduce, norm apply/rope and cache store kernels per tensor.
+  D, per, rows = head_dim, head_dim//32, heads+kv_heads
+  sp = start_pos.unbind_all()[0]
+  warps = _tile(rows, 8, 4, 2, 1)
+  block, lane, warp = UOp.range(rows//warps, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP), UOp.range(warps, 1, AxisType.LOCAL)
+  row = block*warps + warp
+  is_q = row < heads
+  kv_row = (row - heads).maximum(0)
+  e0 = lane*per  # first of this lane's head elements
+  vals = [is_q.where(q[row.minimum(heads-1)*D + e0 + i].load(), k[kv_row*D + e0 + i].load()) for i in range(per)]
+  rms = (warp_reduce(sum((x*x for x in vals[1:]), vals[0]*vals[0]))/D + eps).rsqrt()
+  normed = [x*rms*is_q.where(q_norm[e0+i].load(), k_norm[e0+i].load()) for i, x in enumerate(vals)]
+  partner = [_shfl_xor(x, 16) for x in normed]
+  first = lane < 16
+  out = []
+  for i in range(per):
+    f = (e0 + i) % (D//2)
+    cos, sin = freqs[sp, f].load(), freqs[sp, D//2 + f].load()
+    out.append(first.where(normed[i]*cos - partner[i]*sin, normed[i]*cos + partner[i]*sin))
+  cw = cache.reshape(2, kv_heads, cache.shape[-2], D)
+  stores = [q_out[row.valid(is_q)*D + e0 + i].store(out[i].cast(dtypes.half)) for i in range(per)]
+  stores += [cw[0, kv_row.valid(is_q.logical_not()), sp, e0 + i].store(out[i].cast(dtypes.half)) for i in range(per)]
+  stores += [cw[1, kv_row.valid(is_q.logical_not()), sp, e0 + i].store(v[kv_row*D + e0 + i].load().cast(dtypes.half)) for i in range(per)]
+  return UOp.group(*stores).end(block, lane, warp).sink(arg=KernelInfo(name="qk_prep", opts_to_apply=()))
+
+def nv_qk_prep_supported(q:Tensor, cache_kv:Tensor, head_dim:int) -> bool:
+  return nv_custom_kernels_supported(q.device) and isinstance(q.device, str) and head_dim % 32 == 0 and cache_kv.shape[1] == 1
+
+def nv_qk_prep(q:Tensor, k:Tensor, v:Tensor, q_norm:Tensor, k_norm:Tensor, freqs:Tensor, cache_kv:Tensor, start_pos:UOp,
+               heads:int, kv_heads:int, head_dim:int, eps:float) -> tuple[Tensor, Tensor]:
+  # decode (one token, batch 1): returns the normed, rotated queries (1, heads, 1, head_dim) as half and the cache with k and v written
+  q_out = Tensor.empty(heads*head_dim, dtype=dtypes.half, device=q.device)
+  fxn = functools.partial(_qk_prep_kernel, start_pos=start_pos, heads=heads, kv_heads=kv_heads, head_dim=head_dim, eps=eps)
+  freqs = Tensor(freqs.float().contiguous().uop.after(start_pos))  # an input carries the start_pos binding into the kernel
+  q_out, kv = Tensor.custom_kernel(q_out, cache_kv, *(t.reshape(-1).float().contiguous() for t in (q, k, v)), q_norm.float().contiguous(),
+                                   k_norm.float().contiguous(), freqs, fxn=fxn)[:2]
+  return q_out.reshape(1, heads, 1, head_dim), kv
+
 # ******** prefill: flash attention ********
 
 FA_BLOCK_M, FA_BLOCK_N, FA_WARPS, LOG2E = 64, 64, 4, math.log2(math.e)

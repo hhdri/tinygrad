@@ -3,7 +3,7 @@ import enum, functools, itertools, math, pathlib, re
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, silu_gate, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.nv import nv_flash_attention, nv_flash_attention_supported, nv_mmq_supported
+from tinygrad.llm.kernels.nv import nv_flash_attention, nv_flash_attention_supported, nv_mmq_supported, nv_qk_prep, nv_qk_prep_supported
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
 from tinygrad.uop.ops import resolve, Ops
 
@@ -206,11 +206,19 @@ class TransformerBlock(FFNBlock):
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     q, k, v = Linear.project(x, self.attn_q, self.attn_k, self.attn_v)
+    B, T, _ = x.shape
+    cfg = self.config
+    # NVIDIA decode: q/k norm, rope and the KV cache write in one kernel, then the flash-decoding kernel
+    if T == 1 and B == 1 and cfg.qk_norm == cfg.head_dim and cfg.rope_dim == cfg.head_dim and not cfg.attn_output_gate and \
+       not cfg.sliding_window and not hasattr(self, 'attn_sinks') and nv_qk_prep_supported(q, self.cache_kv, cfg.head_dim) and \
+       isinstance(start_pos, UOp) and (q_norm:=self.attn_q_norm.weight) is not None and (k_norm:=self.attn_k_norm.weight) is not None:
+      qh, assigned_kv = nv_qk_prep(q, k, v, q_norm, k_norm, self.freqs_cis, self.cache_kv, start_pos, cfg.n_heads, cfg.n_kv_heads,
+                                   cfg.head_dim, cfg.norm_eps)
+      return self.attn_output(flash_attention(qh, assigned_kv, start_pos+T).transpose(1, 2).reshape(B, T, -1))
     # v gets its own kernel: fused into the stacked KV cache store, the k half of the store would also run the v matmul
     v = _own_kernel(v)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    B, T, _ = x.shape
     if self.config.attn_output_gate:
       qg = q.reshape(B, T, self.config.n_heads, 2, self.config.head_dim)
       q, gate = qg[:, :, :, 0, :], qg[:, :, :, 1, :].reshape(B, T, self.config.n_heads * self.config.head_dim)
