@@ -8,7 +8,7 @@ from tinygrad.dtype import ConstType, dtypes, DType, DTypeLike, truncate, least_
 from tinygrad.dtype import PyConst, InvalidType, bitcast
 from tinygrad.device import Buffer, BufferSpec, MultiBuffer, canonicalize_device, is_disk_device, TinyELF
 from tinygrad.helpers import ContextVar, all_int, prod, getenv, all_same, Context, partition, temp, unwrap, T, argfix, Metadata, flatten, TRACEMETA
-from tinygrad.helpers import PROFILE, dedup, cdiv, cmod, floordiv, floormod, diskcache_put, to_function_name, cpu_profile, TracingKey
+from tinygrad.helpers import PROFILE, dedup, round_up, cdiv, cmod, floordiv, floormod, diskcache_put, to_function_name, cpu_profile, TracingKey
 from tinygrad.helpers import VIZ, SPEC, CAPTURE_PROCESS_REPLAY, DISALLOW_BROADCAST, get_shape, fully_flatten, to_tuple
 from tinygrad.helpers import colored, ansilen, printable, Target, is_image_shape, strides_for_shape
 if TYPE_CHECKING:
@@ -1324,6 +1324,7 @@ class KernelInfo:
   opts_to_apply: tuple|None = None
   estimates: Estimates|None = None
   beam: int = 0
+  min_blocks: int = 1           # blocks per SM the kernel's register use must allow (CUDA __launch_bounds__ minBlocksPerMultiprocessor)
   @property
   def function_name(self): return to_function_name(self.name)
 
@@ -1336,6 +1337,7 @@ class ProgramInfo:
   outs: tuple[int, ...] = ()
   ins: tuple[int, ...] = ()
   target: Target = Target()
+  shared_mem: int = 0  # bytes of the kernel's LOCAL buffers, each 16-byte aligned
 
   def launch_dims(self, var_vals:dict[str, int]) -> tuple[tuple[int, ...], tuple[int, ...]]:
     global_size = tuple([sym_infer(sz, var_vals) for sz in self.global_size])  # type: ignore[arg-type]
@@ -1354,7 +1356,9 @@ class ProgramInfo:
     ins: list[int] = []
     global_size: list[int] = [1, 1, 1]
     local_size: list[int] = [1, 1, 1]
+    shared_mem = 0
     for u in sink.toposort():
+      if u.op in (Ops.BUFFER, Ops.ALLOC) and u.addrspace == AddrSpace.LOCAL: shared_mem += round_up(u.max_numel()*u.dtype.itemsize, 16)
       if u.op is Ops.PARAM and u.addrspace == AddrSpace.ALU: _vars.append(u)
       if u.op is Ops.PARAM and u.addrspace != AddrSpace.ALU: _globals.append(u.arg.slot)
       if u.op in (Ops.STORE, Ops.LOAD):
@@ -1364,7 +1368,7 @@ class ProgramInfo:
     if not outs and not ins: outs = ins = _globals # if neither is inferred, default to all buffers
     return ProgramInfo(tuple(global_size), tuple(local_size),
                        tuple(sorted(_vars, key=lambda v: v.arg.slot)), tuple(sorted(dedup(_globals))), tuple(sorted(dedup(outs))),
-                       tuple(sorted(dedup(ins))), target)
+                       tuple(sorted(dedup(ins))), target, shared_mem)
 
 # the body of a CALL is always one of these: programs (SINK/PROGRAM/LINEAR), bulk stores, and function references
 OPAQUE_CALL_BODIES = {Ops.SINK, Ops.PROGRAM, Ops.LINEAR, Ops.STORE, Ops.CUSTOM_FUNCTION}
