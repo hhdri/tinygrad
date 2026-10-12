@@ -1,7 +1,8 @@
 import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid, flash_attention
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq, nv_flash_attention, nv_mmq_supported
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
@@ -108,10 +109,163 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
 
   @unittest.skipIf(Device.DEFAULT == "WEBGPU", "slow on WEBGPU")
   def test_quant_linear_fallback(self):
-    if amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("run with DISABLE_AMD_KERNELS=1")
+    if amd_custom_kernels_supported(dev:=Tensor.empty(1).device) or nv_custom_kernels_supported(dev):
+      self.skipTest("run with DISABLE_AMD_KERNELS=1 DISABLE_NV_KERNELS=1")
     # per-type dequant math on the generic path is covered by test_gguf, spot check a representative set here
     for typ in (12, 14, 17, 23):
       with self.subTest(ggml_type=typ):
         self._test_quant_linear(typ, QUANT_SIZES[typ], in_features=256, out_features=16, token_counts=(1, 3), bias=True, custom=False)
 
+class TestNVQuantLinear(unittest.TestCase):
+  def setUp(self):
+    if not nv_custom_kernels_supported(Device.DEFAULT): self.skipTest("NV or CUDA (sm_61+) required")
+
+  def test_mmq(self):
+    if int(Device[Device.DEFAULT].renderer.target.arch[3:]) < 80: self.skipTest("SM80 required")
+    rng = np.random.default_rng(42)
+    # shapes cover 1-4 row and token tiles per warp, 1-2 row and 1-4 token warps per block, and padded tokens
+    for typ,(k,n,t) in itertools.product((12,14), ((256,16,8), (1024,32,16), (256,16,3), (512,128,128), (256,48,40))):
+      for d,dmin,zero in ((0.001,0.0002,False), (-0.01,-0.002,False), (0.001,0.0002,True)):
+        with self.subTest(typ=typ, k=k, n=n, tokens=t, d=d, zero=zero):
+          packed = rng.integers(0,256,(n*k//256,QUANT_SIZES[typ]),dtype=np.uint8)
+          if typ == 12: packed[:,:4] = np.array([d,dmin],np.float16).view(np.uint8)
+          else: packed[:,-2:] = np.array([d],np.float16).view(np.uint8)
+          raw = Tensor(packed.ravel()).realize()
+          weight = ggml_data_to_tensor(raw,n*k,typ).reshape(n,k).numpy().astype(np.float64)
+          x = rng.normal(size=(t,k)).astype(np.float32)
+          if zero: x.fill(0)
+          grouped = x.reshape(t,-1,32)
+          scale = np.maximum(np.abs(grouped).max(-1,keepdims=True)/127,1e-30)
+          reference = (np.rint(grouped/scale)*scale).reshape(t,k).astype(np.float64) @ weight.T
+          actual = nv_mmq(raw.bitcast(dtypes.uint32 if typ == 12 else dtypes.uint16),Tensor(x),k,n,typ).numpy()
+          np.testing.assert_allclose(actual,reference,atol=2e-4,rtol=2e-4)
+
+  def test_mmq_symbolic_dispatch(self):
+    if int(Device[Device.DEFAULT].renderer.target.arch[3:]) < 80: self.skipTest("SM80 required")
+    rng = np.random.default_rng(11)
+    for typ in (12,14):
+      # 256 padded tokens span two 128-token blocks: 3 and 16 live tokens launch only the first, 130 both
+      for tokens in (3,16,130):
+        with self.subTest(typ=typ, tokens=tokens):
+          packed = rng.integers(0,256,(16*1024//256,QUANT_SIZES[typ]),dtype=np.uint8)
+          if typ == 12: packed[:,:4] = np.array([.001,.0002],np.float16).view(np.uint8)
+          else: packed[:,-2:] = np.array([.001],np.float16).view(np.uint8)
+          raw = Tensor(packed.ravel()).realize()
+          layer = Linear(1024,16,bias=False)
+          layer.weight = ggml_data_to_tensor(raw,16*1024,typ).reshape(16,1024)
+          x = rng.normal(size=(tokens,1024)).astype(np.float32)
+          inp = Tensor(np.pad(x,((0,256-tokens),(0,0)))).contiguous()[:UOp.variable("mmq_tokens",1,256).bind(tokens)]
+          actual = function(lambda x: layer(x), allow_implicit=True)(inp)[:tokens].numpy()
+          np.testing.assert_allclose(actual,layer(Tensor(x)).numpy(),atol=2e-4,rtol=2e-4)
+
+  def test_dense_decode(self):
+    rng = np.random.default_rng(3)
+    for k, n in ((256, 4), (4096, 64), (4096, 1024), (768, 7), (384, 4)):
+      for dtype in (np.float16, np.float32):
+        with self.subTest(k=k, n=n, dtype=dtype):
+          weight = rng.normal(size=(n, k)).astype(np.float16)
+          linear = Linear(k, n, bias=True)
+          linear.weight = Tensor(weight).cast(dtypes.float32)
+          bias = rng.normal(size=n).astype(np.float32)
+          linear.bias = Tensor(bias)
+          for tokens in (1, 3):
+            x = rng.normal(size=(1, tokens, k)).astype(dtype)
+            # prefill is an F16 matmul with F32 accumulation; without tensor cores the products round to F16
+            ref_x, tol = (x.astype(np.float16).astype(np.float32), 1e-3*np.sqrt(k)) if tokens > 1 else (x.astype(np.float32), 2e-4)
+            np.testing.assert_allclose(linear(Tensor(x)).numpy(), ref_x @ weight.astype(np.float32).T + bias, rtol=tol, atol=tol)
+          np.testing.assert_allclose(linear(Tensor.zeros(1, k)).numpy(), bias[None], atol=1e-6)
+
+  def test_dense_extreme_values(self):
+    weight = np.tile(np.array([65504, -65504, 6e-8, -6e-8], np.float16), (4, 64))
+    linear = Linear(256, 4, bias=False)
+    linear.weight = Tensor(weight)
+    x = np.tile(np.array([1, -1, 1e-3, -1e-3], np.float32), (1, 64))
+    np.testing.assert_allclose(linear(Tensor(x)).numpy(), x @ weight.astype(np.float32).T, rtol=1e-6)
+
+  def _check(self, ggml_type:int, in_features:int, out_features:int, d:float, dmin:float, x:np.ndarray, offset:int=0):
+    rng = np.random.default_rng(ggml_type)
+    packed = rng.integers(0, 256, (out_features*in_features//256, QUANT_SIZES[ggml_type]), dtype=np.uint8)
+    if ggml_type == 14: packed[:, -2:] = np.array([d], dtype=np.float16).view(np.uint8)
+    else: packed[:, :4] = np.array([d, dmin], dtype=np.float16).view(np.uint8)
+    # the offset checks views into the GGUF storage that are only halfword aligned
+    raw = Tensor(np.pad(packed.flatten(), (offset, 0))).contiguous().realize()[offset:]
+    decoded = ggml_data_to_tensor(raw, out_features*in_features, ggml_type).reshape(out_features, in_features)
+    weight = decoded.numpy().astype(np.float64)
+    linear = Linear(in_features, out_features, bias=False)
+    linear.weight = decoded
+    actual = linear(Tensor(x)).numpy()
+    self.assertEqual(linear.ggml_type, ggml_type)
+    # quantize in float32 like the kernel: float64 division rounds some ties the other way
+    grouped = x.astype(np.float32).reshape(*x.shape[:-1], -1, 32)
+    scale = np.maximum(np.abs(grouped).max(-1, keepdims=True) / np.float32(127), np.float32(1e-30))
+    ref = (np.clip(np.rint(grouped/scale), -127, 127).astype(np.float64)*scale).reshape(x.shape) @ weight.T
+    np.testing.assert_allclose(actual, ref, rtol=2e-4, atol=2e-4*max(1.0, float(np.abs(ref).max())))
+
+  def test_decode_shapes(self):
+    rng = np.random.default_rng(0)
+    for ggml_type, (k, n) in itertools.product((12, 14), ((1024, 4), (4096, 64), (12288, 8))):
+      with self.subTest(ggml_type=ggml_type, k=k, n=n):
+        self._check(ggml_type, k, n, 0.001, 0.0002, rng.normal(size=(1, k)).astype(np.float16))
+
+  def test_decode_edge_values(self):
+    rng = np.random.default_rng(1)
+    x = rng.normal(size=(1, 1, 2048)).astype(np.float32) * np.repeat(rng.choice([0, 1e-3, 1, 300], 64), 32)
+    for ggml_type, (d, dmin) in itertools.product((12, 14), ((0.0, 0.0), (-0.75, 0.5), (60000.0, -60000.0), (6e-8, 3e-5))):
+      with self.subTest(ggml_type=ggml_type, d=d, dmin=dmin):
+        self._check(ggml_type, 2048, 16, d, dmin, x, offset=2 if ggml_type == 14 else 0)
+    self._check(12, 2048, 16, 0.01, 0.01, np.zeros((1, 2048), np.float32))
+
+  def test_unsupported_shapes_fall_back(self):
+    for typ, (k, n) in ((12, (512, 4)), (14, (1024, 6))):
+      raw = Tensor(np.random.default_rng(2).integers(0, 0x3c, n*k//256*QUANT_SIZES[typ], dtype=np.uint8)).realize()
+      linear = Linear(k, n, bias=False)
+      linear.weight = ggml_data_to_tensor(raw, n*k, typ).reshape(n, k)
+      x = Tensor(np.ones((1, k), np.float32))
+      np.testing.assert_allclose(linear(x).numpy(), (x @ linear.weight.T).numpy(), rtol=1e-5)
+      self.assertIsNone(linear.ggml_type)
+
 if __name__ == "__main__": unittest.main()
+
+class TestNVFlashAttention(unittest.TestCase):
+  def setUp(self):
+    if not nv_mmq_supported(Device.DEFAULT): self.skipTest("NV or CUDA (sm_80+) required")
+
+  def test_flash_attention_prefill(self):
+    # causal attention over the half KV cache vs float64 NumPy: GQA, chunk offsets, padded symbolic chunks, a single token
+    rng = np.random.default_rng(0)
+    B, H, KVH, D, N = 1, 4, 2, 64, 256
+    # T_max None: a static length that is not a whole 64-row block
+    for start, T, T_max in ((0, 64, 64), (0, 37, 64), (64, 100, 128), (5, 128, 128), (0, 1, 64), (3, 45, None)):
+      with self.subTest(start=start, T=T, T_max=T_max):
+        cache = np.zeros((2, B, KVH, N, D), np.float16)
+        cache[:, :, :, :start+T] = rng.standard_normal((2, B, KVH, start+T, D)).astype(np.float16)
+        q = rng.standard_normal((B, H, T, D)).astype(np.float32)
+        if T_max is None: actual = nv_flash_attention(Tensor(q).realize(), Tensor(cache).realize(), start+T).numpy()
+        else:
+          qt = Tensor(np.pad(q, ((0,0), (0,0), (0,T_max-T), (0,0)))).realize()
+          v = UOp.variable("toks", 1, T_max).bind(T)
+          qin, end = (qt, start+T) if T == T_max else (qt[:, :, :v], start+v)
+          out = nv_flash_attention(qin, Tensor(cache).realize(), end).realize()
+          actual = np.frombuffer(out.uop.base.buffer.as_memoryview(), np.float32).reshape(B, H, T_max, D)[:, :, :T]
+        k, v = (np.repeat(cache[i, :, :, :start+T].astype(np.float64), H//KVH, axis=1) for i in range(2))
+        scores = q.astype(np.float16).astype(np.float64) @ k.transpose(0, 1, 3, 2) / np.sqrt(D)
+        scores[..., np.arange(start+T)[None, :] > (start + np.arange(T))[:, None]] = -np.inf
+        probs = np.exp(scores - scores.max(-1, keepdims=True))
+        np.testing.assert_allclose(actual, (probs / probs.sum(-1, keepdims=True)) @ v, atol=5e-3, rtol=5e-3)
+
+  def test_flash_attention_decode(self):
+    # single-token attention over the half KV cache vs float64 NumPy: Qwen3's 4-query GQA group, chunk boundaries, a context longer
+    # than one round of partial chunks, and a symbolic length
+    rng = np.random.default_rng(1)
+    B, H, KVH, D, N = 1, 8, 2, 128, 4096
+    for L, symbolic in ((1, False), (31, False), (32, False), (33, False), (560, True), (2049, False), (4096, True)):
+      with self.subTest(L=L, symbolic=symbolic):
+        cache = np.zeros((2, B, KVH, N, D), np.float16)
+        cache[:, :, :, :L] = rng.standard_normal((2, B, KVH, L, D)).astype(np.float16)
+        q = rng.standard_normal((B, H, 1, D)).astype(np.float32)
+        end = UOp.variable("start_pos", 0, N-1).bind(L-1) + 1 if symbolic else L
+        actual = flash_attention(Tensor(q).realize(), Tensor(cache).realize(), end).numpy()
+        k, v = (np.repeat(cache[i, :, :, :L].astype(np.float64), H//KVH, axis=1) for i in range(2))
+        scores = q.astype(np.float16).astype(np.float64) @ k.transpose(0, 1, 3, 2) / np.sqrt(D)
+        probs = np.exp(scores - scores.max(-1, keepdims=True))
+        np.testing.assert_allclose(actual, (probs / probs.sum(-1, keepdims=True)) @ v, atol=5e-3, rtol=5e-3)

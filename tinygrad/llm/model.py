@@ -3,6 +3,7 @@ import enum, functools, itertools, math, pathlib, re
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.nv import nv_flash_attention, nv_flash_attention_supported, nv_mmq_supported
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
 from tinygrad.uop.ops import resolve
 
@@ -111,6 +112,11 @@ class TransformerConfig:
   sliding_window: int = 0
   sliding_window_pattern: int = 0
 
+def _silu_gate(gate:Tensor) -> Tensor:
+  # TODO: remove the need for this contiguous. A lazy gate matmul needs its own kernel (fused into the up/down product it is much
+  # slower); a gate that is already a buffer (custom kernel output) is cheaper fused into its consumer
+  return gate.silu() if gate.uop.base.has_buffer_identity(after_ok=True) else gate.silu().contiguous()
+
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
     self.config = config
@@ -161,12 +167,11 @@ class FFNBlock:
       x_down = self.ffn_down_exps(sel, act.contiguous())  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
-        shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
+        shexp = self.ffn_down_shexp(_silu_gate(self.ffn_gate_shexp(x)) * self.ffn_up_shexp(x))
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out
-    # TODO: remove the need for this contiguous
-    return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
+    return self.ffn_down(_silu_gate(self.ffn_gate(x)) * self.ffn_up(x))
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
@@ -220,6 +225,11 @@ class TransformerBlock(FFNBlock):
     if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
       attn = flash_attention(q, assigned_kv, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
+      return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
+    # on NVIDIA, attention without windows or sinks runs on the KV cache: causal prefill in the NV flash attention kernel, single-token
+    # decode in the flash-decoding kernel shared with RDNA
+    if not self.config.sliding_window and not hasattr(self, 'attn_sinks') and nv_flash_attention_supported(q, assigned_kv):
+      attn = (nv_flash_attention if resolve(T != 1) else flash_attention)(q, assigned_kv, start_pos+T).transpose(1, 2).reshape(B, T, -1)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
     k = assigned_kv[0, :, :, 0:start_pos+T, :]
     v = assigned_kv[1, :, :, 0:start_pos+T, :]
@@ -543,7 +553,9 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0):
+    # the NV prefill kernels stream every weight once per chunk and launch only the live tokens' blocks: large chunks pay off
+    if chunk_size is None: chunk_size = 512 if nv_mmq_supported(self.token_embd.weight.device) else 32
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)

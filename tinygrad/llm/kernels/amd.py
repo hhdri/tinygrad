@@ -7,6 +7,8 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv, nv_mmq, nv_mmq_supported
+from tinygrad.llm.kernels.nv import warp_reduce as nv_warp_reduce
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -60,9 +62,9 @@ class Linear(nn.Linear):
   def __init__(self, in_features:int, out_features:int, bias=True):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
-  def set_quantized(self, decoded:Tensor):
+  def set_quantized(self, decoded:Tensor, types:tuple[int, ...]=tuple(QUANT_SIZES)):
     if self.in_features % GGML_BLOCK_SIZE: return
-    packed_sizes = {typ: decoded.numel() // 256 * type_size for typ,type_size in QUANT_SIZES.items()}
+    packed_sizes = {typ: decoded.numel() // 256 * QUANT_SIZES[typ] for typ in types}
     graph = decoded.uop.toposort()
     raw = next((u for u in graph if u.op in (Ops.SHRINK, Ops.BUFFER, Ops.UNSHARD) and u.dtype == dtypes.uint8 and
                 prod(u.shape) in packed_sizes.values()), None)
@@ -89,6 +91,7 @@ class Linear(nn.Linear):
     self.shard_axis = decoded.uop.axis
     self.weight = Tensor(raw).flatten().bitcast(word_dtype).contiguous()
   def __call__(self, x:Tensor) -> Tensor:
+    if self.use_custom_quant and nv_custom_kernels_supported(self.weight.device): return self._nv_call(x)
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
@@ -108,6 +111,35 @@ class Linear(nn.Linear):
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return super().__call__(x)
+
+  def _nv_call(self, x:Tensor) -> Tensor:
+    if self.ggml_type is None:
+      # keep the lazy dequantization for the shapes the packed kernels don't cover
+      self.dense = self.weight
+      if isinstance(self.weight.device, str): self.set_quantized(self.weight, (Q4_K, Q6_K))
+      # Dense storage only: unsupported packed formats must keep their fused dequantization fallback.
+      if self.ggml_type is None and (weight:=_view_back(self.weight)).dtype == dtypes.float16 and weight.uop.contiguous_view() is not None \
+        and self.weight.uop.axis is None \
+        and self.in_features % 256 == 0 and self.out_features % 4 == 0:
+        if isinstance(numel:=x.numel(), int) and numel == self.in_features:
+          out = nv_f16_gemv(weight, x, self.in_features, self.out_features)
+        # prefill: F16 activations with F32 accumulation run on tensor cores; F32 activations would promote the weight to F32.
+        # contiguous() turns the uint8 GGUF view into a zero-copy F16 buffer view: through the bitcast the matmul loaded bytes.
+        else: out = x.cast(dtypes.float16).matmul(weight.contiguous().T, dtype=dtypes.float32)
+        return out if self.bias is None else out + self.bias
+      if not nv_linear_supported(self.ggml_type, self.in_features, self.out_features):
+        self.use_custom_quant, self.weight, self.ggml_type = False, self.dense, None
+        return super().__call__(x)
+    assert self.ggml_type is not None
+    numel = x.numel()
+    if prod(x.max_shape) > self.in_features and self.out_features % 16 == 0 and nv_mmq_supported(self.weight.device):
+      out = nv_mmq(self.weight, x if isinstance(numel, int) else x.pad_to(x.max_shape),
+                   self.in_features, self.out_features, self.ggml_type, None if isinstance(numel, int) else numel//self.in_features)
+      if not isinstance(numel, int): out = out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+      return out if self.bias is None else out + self.bias
+    if not isinstance(numel, int) or numel != self.in_features: return x.linear(self.dense.T, self.bias)
+    out = nv_q8_linear(self.weight, self.ggml_type, x, self.in_features, self.out_features)
+    return out if self.bias is None else out + self.bias
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, src=(a, b, c), arg=("__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)", dtypes.int32))
@@ -512,7 +544,7 @@ def _vec_load(ptr:UOp, lanes:int) -> tuple[UOp, ...]:
   return tuple(vec[i].float() for i in range(lanes))
 
 @functools.cache
-def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4):
+def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4, nv=False):
   valid_kv_len = _unbind(valid_kv_len)
   _, B, H_KV, N, D = cast(tuple[int, int, int, int, int], cache_kv.shape)
   _, H, M, _ = cast(tuple[int, int, int, int], q.shape)
@@ -542,7 +574,8 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
     # V is prefetched in the score pass so both streams are in flight together
     vfrags[j] = tuple(valid.where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
     for h in range(G):
-      s = warp_reduce(sum((qf[h][i]*kfrag[i] for i in range(DPL)), UOp.const(0, dtypes.float)), full_wave=True) * (1/math.sqrt(D))
+      dot = sum((qf[h][i]*kfrag[i] for i in range(DPL)), UOp.const(0, dtypes.float))
+      s = (nv_warp_reduce(dot) if nv else warp_reduce(dot, full_wave=True)) * (1/math.sqrt(D))
       scores[j][h] = valid.where(s, UOp.const(-1e30, dtypes.float))
   # A finite initial max keeps fully masked waves from computing exp(-inf - -inf).
   acc_reg, max_reg, sum_reg = _reg((G, DPL), 0), _reg((G,), -1e30), _reg((G,), 0)
@@ -623,15 +656,18 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   # Carry length bindings even when the cache was populated independently of this call.
   if isinstance(valid_kv_len, UOp): cache_kv = Tensor(cache_kv.uop.after(valid_kv_len))
   B, H, D = cache_kv.shape[1], q.shape[1], cache_kv.shape[4]
-  chunks, axis = min(48, max_kv_len // 64), q.uop.axis
+  # NVIDIA: smaller chunks and blocks spread a short context over more of the SMs (RTX 4060, 560-token context: 622 -> 524 us/token)
+  nv = nv_custom_kernels_supported(q.device)
+  block_n, waves, group = 32 if nv else 64, 8 if nv else 16, H // cache_kv.shape[2]
+  chunks, axis = min(64 if nv else 48, max_kv_len // block_n), q.uop.axis
   partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device, axis=axis)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device, axis=axis)
-  waves, group = 16, H // cache_kv.shape[2]
-  while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
+  while waves * group * ((D+LDS_PAD)*2 + 8) > (49152 if nv else 65536): waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
-  fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=64, waves=waves)
+  fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=block_n,
+                          waves=waves, nv=nv)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
-  live = (valid_kv_len+63)//64
+  live = (valid_kv_len+block_n-1)//block_n
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)
   out = Tensor.empty(B, H, 1, D, dtype="float32", device=q.device, axis=axis)
   fxn = functools.partial(_amd_flash_decode_combine, live=live)
