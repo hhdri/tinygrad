@@ -144,19 +144,23 @@ class TestNVQuantLinear(unittest.TestCase):
     if int(Device[Device.DEFAULT].renderer.target.arch[3:]) < 80: self.skipTest("SM80 required")
     rng = np.random.default_rng(11)
     for typ in (12,14):
-      # 256 padded tokens span two 128-token blocks: 3 and 16 live tokens launch only the first, 130 both
-      for tokens in (3,16,130):
+      # 384 padded tokens span three 128-token blocks: 3 and 16 live tokens launch only the first, 130 and 200 two, 300 all. Live counts
+      # ending in a 1-64 token tail (3, 16, 130, and 300 for Q4_K) run on the 64-token-block kernels, the others on the 128-token ones
+      for tokens in (3,16,100,130,200,300):
         with self.subTest(typ=typ, tokens=tokens):
-          packed = rng.integers(0,256,(16*1024//256,QUANT_SIZES[typ]),dtype=np.uint8)
+          packed = rng.integers(0,256,(128*1024//256,QUANT_SIZES[typ]),dtype=np.uint8)
           if typ == 12: packed[:,:4] = np.array([.001,.0002],np.float16).view(np.uint8)
           else: packed[:,-2:] = np.array([.001],np.float16).view(np.uint8)
           raw = Tensor(packed.ravel()).realize()
-          layer = Linear(1024,16,bias=False)
-          layer.weight = ggml_data_to_tensor(raw,16*1024,typ).reshape(16,1024)
+          layer = Linear(1024,128,bias=False)
+          layer.weight = ggml_data_to_tensor(raw,128*1024,typ).reshape(128,1024)
           x = rng.normal(size=(tokens,1024)).astype(np.float32)
-          inp = Tensor(np.pad(x,((0,256-tokens),(0,0)))).contiguous()[:UOp.variable("mmq_tokens",1,256).bind(tokens)]
+          inp = Tensor(np.pad(x,((0,384-tokens),(0,0)))).contiguous()[:UOp.variable("mmq_tokens",1,384).bind(tokens)]
           actual = function(lambda x: layer(x), allow_implicit=True)(inp)[:tokens].numpy()
           np.testing.assert_allclose(actual,layer(Tensor(x)).numpy(),atol=2e-4,rtol=2e-4)
+          # a lazy input is written into an uninitialized max-size buffer (live rows only) instead of passed on as a buffer slice
+          actual = function(lambda x: layer(x*2), allow_implicit=True)(inp)[:tokens].numpy()
+          np.testing.assert_allclose(actual,layer(Tensor(x*2)).numpy(),atol=4e-4,rtol=2e-4)
 
   def test_swiglu(self):
     # silu(gate)*up quantized inside the q8 kernel vs the product as an ordinary input: decode, static and symbolic prefill (gate and up

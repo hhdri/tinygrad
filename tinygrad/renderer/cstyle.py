@@ -480,12 +480,14 @@ class CUDARenderer(CStyleLanguage):
     prefix = ["typedef unsigned int uint;", "#define INFINITY (__int_as_float(0x7f800000))", "#define NAN (__int_as_float(0x7fffffff))",
               "template <class T, class F> __device__ __forceinline__ T tg_bitcast(F v) { union U { F f; T t; }; U u; u.f = v; return u.t; }"]
     used_dtypes = uops_to_dtypes(uops)
-    for n, ty in ((1, "uint"), (2, "uint2"), (4, "uint4")):
-      if not any(u.op is Ops.LOAD and u.arg == f"ldmatrix_x{n}" for u in uops): continue
-      # the memory clobber keeps the load on its side of the barriers (the compiler can't see the asm read shared memory)
+    for (n, ty), trans in itertools.product(((1, "uint"), (2, "uint2"), (4, "uint4")), ("", "_trans")):
+      if not any(u.op is Ops.LOAD and u.arg == f"ldmatrix_x{n}{trans}" for u in uops): continue
+      # the memory clobber keeps the load on its side of the barriers (the compiler can't see the asm read shared memory); _trans loads
+      # each 8x8 matrix transposed
       regs, outs = ", ".join(f"%{i}" for i in range(n)), ", ".join(f'"=r"(r{"." + "xyzw"[i] if n > 1 else ""})' for i in range(n))
-      prefix.append(f"__device__ __forceinline__ {ty} tg_ldmatrix_x{n}(const void* p) {{ {ty} r; asm volatile(\"ldmatrix.sync.aligned.m8n8.x{n}"
-                    f".shared.b16 {{" + regs + f"}}, [%{n}];\" : {outs} : \"r\"((unsigned)__cvta_generic_to_shared(p)) : \"memory\"); return r; }}")
+      prefix.append(f"__device__ __forceinline__ {ty} tg_ldmatrix_x{n}{trans}(const void* p) {{ {ty} r; asm volatile(\"ldmatrix.sync.aligned"
+                    f".m8n8.x{n}{'.trans' if trans else ''}.shared.b16 {{" + regs + f"}}, [%{n}];\" : {outs} : "
+                    f"\"r\"((unsigned)__cvta_generic_to_shared(p)) : \"memory\"); return r; }}")
     if any(dt in dtypes.fp8s for dt, _ in used_dtypes): prefix.append("#include <cuda_fp8.h>")
     if any(dt == dtypes.half for dt, _ in used_dtypes): prefix.append("#include <cuda_fp16.h>")
     if any(dt == dtypes.bfloat16 for dt, _ in used_dtypes): prefix.append("#include <cuda_bf16.h>")
