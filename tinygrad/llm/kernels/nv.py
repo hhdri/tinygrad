@@ -48,32 +48,45 @@ def _tile(n:int, *sizes:int) -> int: return next(s for s in sizes if n % s == 0)
 # ******** q8 activations ********
 
 @functools.cache
-def _q8_quantize_kernel(xq:UOp, xd:UOp, xs:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
+def _q8_quantize_kernel(xq:UOp, xd:UOp, xs:UOp, x:UOp, *up:UOp, tokens:int, in_features:int, live:UOp|None=None,
+                        group_major:bool=True) -> UOp:
   # each lane loads four consecutive values and owns one packed word: a warp covers four groups of 32, the group maximum
   # reduces over 8 lanes and the per-16 sums over 4. Several warps per block keep the occupancy up.
   chunks = in_features//128
   warps = _tile(tokens*chunks, 8, 4, 2, 1)
-  block, lane, warp = UOp.range(tokens*chunks//warps, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP), \
+  # a padded symbolic chunk quantizes only its live tokens (rounded up to whole blocks); the rows past them stay unwritten
+  blocks = tokens*chunks//warps if live is None else (live.unbind_all()[0]*chunks+warps-1)//warps
+  block, lane, warp = UOp.range(blocks, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP), \
     UOp.range(warps, 1, AxisType.LOCAL)
   token_chunk = block*warps + warp
   token, chunk = token_chunk//chunks, token_chunk%chunks
   values = [v.float() for v in _vload(x, token*in_features + chunk*128 + lane*4, 4)]
+  # with up, x is a SwiGLU gate: quantize silu(x)*up
+  if up: values = [v.silu()*u.float() for v, u in zip(values, _vload(up[0], token*in_features + chunk*128 + lane*4, 4))]
   amax = functools.reduce(UOp.maximum, (v.abs() for v in values))
   # keep the division: reciprocal multiplication can move values across rounding ties
   d = _custom("({0}/127.0f)", dtypes.float, warp_reduce(amax, maximum=True, width=8)).maximum(1e-30)
   quants = [_custom("rintf({0}/{1})", dtypes.float, v, d).clip(-127, 127) for v in values]
   word = functools.reduce(UOp.bitwise_or, (q.cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i,q in enumerate(quants)))
   group, w = chunk*4 + lane//8, lane%8
-  stores = (xq[token, chunk*32 + lane].store(word), xd[token, group.valid(w.eq(0))].store(d),
-            xs[token, group*2 + (w//4).valid((w%4).eq(0))].store(warp_reduce(sum(quants[1:], quants[0]), width=4)))
+  # group major scales and sums: a Q4_K MMQ token block reads a group's values contiguously (Q6_K's staging prefers token major)
+  def at(buf:UOp, g:UOp) -> UOp: return buf[g, token] if group_major else buf[token, g]
+  stores = (xq[token, chunk*32 + lane].store(word), at(xd, group.valid(w.eq(0))).store(d),
+            at(xs, group*2 + (w//4).valid((w%4).eq(0))).store(warp_reduce(sum(quants[1:], quants[0]), width=4)))
   return UOp.group(*stores).end(block, lane, warp).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
-def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
+def q8_quantize(x:Tensor, tokens:int, in_features:int, cache:dict|None=None, up:Tensor|None=None,
+                live:UOp|None=None, group_major:bool=True) -> tuple[Tensor, Tensor, Tensor]:
+  # cache: shared by projections of the same input (Linear.project), which then quantize it once
+  # up: x is a SwiGLU gate, the quantized input is silu(x)*up (never written out)
+  if cache is not None and up is None and (hit:=cache.get((tokens, in_features, group_major))) is not None: return hit
   xq = Tensor.empty(tokens, in_features//4, dtype=dtypes.uint32, device=x.device)
-  xd = Tensor.empty(tokens, in_features//32, dtype=dtypes.float32, device=x.device)
-  xs = Tensor.empty(tokens, in_features//16, dtype=dtypes.float32, device=x.device)
-  fxn = functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features)
-  xq, xd, xs = Tensor.custom_kernel(xq, xd, xs, x.contiguous(), fxn=fxn)[:3]
+  xd = Tensor.empty(*((in_features//32, tokens) if group_major else (tokens, in_features//32)), dtype=dtypes.float32, device=x.device)
+  xs = Tensor.empty(*((in_features//16, tokens) if group_major else (tokens, in_features//16)), dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features, live=live, group_major=group_major)
+  if live is not None: xq = Tensor(xq.uop.after(live))  # carries the live-token binding into the kernel
+  xq, xd, xs = Tensor.custom_kernel(xq, xd, xs, x.contiguous(), *(() if up is None else (up.contiguous(),)), fxn=fxn)[:3]
+  if cache is not None and up is None: cache[(tokens, in_features, group_major)] = (xq, xd, xs)
   return xq, xd, xs
 
 # ******** decode: dp4a gemv ********
@@ -104,7 +117,7 @@ def _q4k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_f
       a, b, c = (s0 >> shift) & 255, (s1 >> shift) & 255, (s2 >> shift) & 255
       return (j < 2).where(a & 63, (c & 15) | ((a >> 6) << 4)).float(), (j < 2).where(b & 63, (c >> 4) | ((b >> 6) << 4)).float()
     (sclo, mnlo), (schi, mnhi) = scale_min(((j%2)*16).cast(dtypes.uint32)), scale_min(((j%2)*16+8).cast(dtypes.uint32))
-    xdlo, xdhi, xslo, xshi = xd[token, y//32].load(), xd[token, y//32+1].load(), xs[token, y//16].load(), xs[token, y//16+2].load()
+    xdlo, xdhi, xslo, xshi = xd[y//32, token].load(), xd[y//32+1, token].load(), xs[y//16, token].load(), xs[y//16+2, token].load()
     return _half(head & 0xffff) * (sclo*dlo.float()*xdlo + schi*dhi.float()*xdhi) - _half(head >> 16) * (mnlo*xslo*xdlo + mnhi*xshi*xdhi)
   return _gemv(out, tokens, out_features, in_features, lane_dot, "q4k_gemv")
 
@@ -127,7 +140,7 @@ def _q6k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_f
     s = n*8 + c*2 + col  # scale of y//16; the high nibbles use s+4
     scales = raw[base + 96 + s//2].load(), raw[base + 98 + s//2].load()
     sclo, schi = ((sc >> ((s%2)*8).cast(dtypes.uint16)).cast(dtypes.uint8).bitcast(dtypes.int8).float() for sc in scales)
-    xdlo, xdhi, xslo, xshi = xd[token, y//32].load(), xd[token, y//32+2].load(), xs[token, y//16].load(), xs[token, y//16+4].load()
+    xdlo, xdhi, xslo, xshi = xd[y//32, token].load(), xd[y//32+2, token].load(), xs[y//16, token].load(), xs[y//16+4, token].load()
     # the -32 offset of the 6-bit quants is folded into the integer dot through the activation sums
     return _half(raw[base + 104].load()) * (sclo*(dlo.float() - 32*xslo)*xdlo + schi*(dhi.float() - 32*xshi)*xdhi)
   return _gemv(out, tokens, out_features, in_features, lane_dot, "q6k_gemv")
@@ -135,12 +148,13 @@ def _q6k_gemv_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_f
 def nv_linear_supported(ggml_type:int|None, in_features:int, out_features:int) -> bool:
   return ggml_type in NV_QUANTS and in_features % 1024 == 0 and out_features % ROWS_PER_BLOCK == 0
 
-def nv_q8_linear(weight:Tensor, ggml_type:int, x:Tensor, in_features:int, out_features:int) -> Tensor:
+def nv_q8_linear(weight:Tensor, ggml_type:int, x:Tensor, in_features:int, out_features:int, q8:dict|None=None,
+                 up:Tensor|None=None) -> Tensor:
   tokens = int(x.numel()) // in_features
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_q4k_gemv_kernel if ggml_type == Q4_K else _q6k_gemv_kernel, tokens=tokens, out_features=out_features,
                           in_features=in_features)
-  return Tensor.custom_kernel(out, weight, *q8_quantize(x, tokens, in_features), fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
+  return Tensor.custom_kernel(out, weight, *q8_quantize(x, tokens, in_features, q8, up), fxn=fxn)[0].reshape(*x.shape[:-1], out_features)
 
 # ******** dense decode ********
 
@@ -253,8 +267,8 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
       sub, tk = i//TM, i%TM
       tok, grp = tok0+tk, stage*groups+sub
       if not q4: return [t_s[buf, sub, masked(tk, v), 0].store(xd[tok, grp//2].load())]
-      d = xd[tok, grp].load()
-      total = xs[tok, grp*2].load()+xs[tok, grp*2+1].load()
+      d = xd[grp, tok].load()
+      total = xs[grp*2, tok].load()+xs[grp*2+1, tok].load()
       return [t_s[buf, sub, masked(tk, v), 0].store(d), t_s[buf, sub, masked(tk, v), 1].store(-total*d)]
     coop(TM*groups, token_terms)
     return stores
@@ -300,15 +314,17 @@ def _mmq_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, tokens:int, out_featur
           for r in range(row_tiles) for j in range(token_tiles) for i in range(4)]
   return UOp.group(*outs).end(token_block, row_block, lane, warp).sink(arg=KernelInfo(name="q4k_mmq" if q4 else "q6k_mmq", opts_to_apply=()))
 
-def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type:int, live:UOp|None=None) -> Tensor:
+def nv_mmq(weight:Tensor, x:Tensor, in_features:int, out_features:int, ggml_type:int, live:UOp|None=None, q8:dict|None=None,
+           up:Tensor|None=None) -> Tensor:
   # live: the symbolic token count of a chunk padded to its max size; the rows past it are left unwritten
   shape = x.shape[:-1]
   tokens = int(x.numel())//in_features
   padded_tokens = (tokens+7)//8*8
   x = x.reshape(tokens, in_features).pad(((0, padded_tokens-tokens), (0, 0)))
+  if up is not None: up = up.reshape(tokens, in_features).pad(((0, padded_tokens-tokens), (0, 0)))
   out = Tensor.empty(padded_tokens, out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_mmq_kernel, tokens=padded_tokens, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
                           live=live)
-  xq, xd, xs = q8_quantize(x, padded_tokens, in_features)
+  xq, xd, xs = q8_quantize(x, padded_tokens, in_features, q8, up, live, group_major=ggml_type == Q4_K)
   if live is not None: xq = Tensor(xq.uop.after(live))
   return Tensor.custom_kernel(out, weight, xq, xd, xs, fxn=fxn)[0][:tokens].reshape(*shape, out_features)
