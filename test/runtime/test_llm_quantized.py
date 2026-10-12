@@ -2,7 +2,7 @@ import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq_supported
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
@@ -134,16 +134,21 @@ def _q8_reference(x:np.ndarray, weight:np.ndarray) -> np.ndarray:
 class TestNVQuantLinear(QuantLinearMixin, unittest.TestCase):
   def setUp(self):
     if not nv_custom_kernels_supported(Device.DEFAULT): self.skipTest("NV or CUDA (sm_61+) required")
+    self.mmq = nv_mmq_supported(Device.DEFAULT)
 
   def test_quant_linear(self):
-    # one token runs the dp4a GEMV. The kernels need 16-byte aligned views (GGUF tensor data is 32-byte aligned)
+    # one token runs the dp4a GEMV; from sm_80 more tokens run the MMQ: partial and whole 128-token blocks, a symbolic count.
+    # The kernels need 16-byte aligned views (GGUF tensor data is 32-byte aligned)
     for typ in (12, 14):
-      with self.subTest(ggml_type=typ): self._test_quant_linear(typ, QUANT_SIZES[typ], token_counts=(1,), offset=16)
+      with self.subTest(ggml_type=typ):
+        self._test_quant_linear(typ, QUANT_SIZES[typ], token_counts=(1, 3, 40, 128) if self.mmq else (1,), offset=16)
+        if self.mmq: self._test_quant_linear(typ, QUANT_SIZES[typ], token_counts=(1, 3), symbolic=True, offset=16)
 
   def test_edge_values(self):
-    # zero inputs, zero/negative/extreme scales: the GEMV vs NumPy
+    # zero inputs, zero/negative/extreme scales: the GEMV and (from sm_80) the MMQ vs NumPy
     rng = np.random.default_rng(1)
     xs = [np.zeros((1, 1, 2048), np.float32), rng.normal(size=(1, 1, 2048)).astype(np.float32) * np.repeat(rng.choice([0, 1e-3, 1, 300], 64), 32)]
+    if self.mmq: xs.append(rng.normal(size=(1, 40, 2048)).astype(np.float32) * 100)
     for typ, (d, dmin) in itertools.product((12, 14), ((0.0, 0.0), (-0.75, 0.5), (60000.0, -60000.0), (6e-8, 3e-5))):
       raw, decoded = _packed(rng, typ, 64, 2048, d, dmin)
       linear = Linear(2048, 64, bias=False)
@@ -154,6 +159,22 @@ class TestNVQuantLinear(QuantLinearMixin, unittest.TestCase):
           ref = _q8_reference(x, weight)
           np.testing.assert_allclose(linear(Tensor(x)).numpy(), ref, rtol=2e-4, atol=2e-4*max(1.0, float(np.abs(ref).max())))
       self.assertEqual(linear.ggml_type, typ)
+
+  def test_mmq_symbolic_dispatch(self):
+    if not self.mmq: self.skipTest("SM80 required")
+    rng = np.random.default_rng(11)
+    for typ in (12, 14):
+      # 384 padded tokens span three 128-token blocks: 3 and 16 live tokens launch only the first, 130 and 200 two, 300 all
+      layer = Linear(1024, 128, bias=False)
+      layer.weight = _packed(rng, typ, 128, 1024)[1]
+      for tokens in (3, 16, 100, 130, 200, 300):
+        with self.subTest(typ=typ, tokens=tokens):
+          x = rng.normal(size=(tokens, 1024)).astype(np.float32)
+          inp = Tensor(np.pad(x, ((0, 384-tokens), (0, 0)))).contiguous()[:UOp.variable("mmq_tokens", 1, 384).bind(tokens)]
+          # a lazy input (x*2) is written into an uninitialized max-size buffer, live rows only, instead of passed on as a slice
+          for f in (lambda x: x, lambda x: x*2):
+            actual = function(lambda x: layer(f(x)), allow_implicit=True)(inp)[:tokens].numpy()
+            np.testing.assert_allclose(actual, layer(f(Tensor(x))).numpy(), atol=4e-4, rtol=2e-4)
 
   def test_dense(self):
     # F16 weights: the GEMV at one token (F16 and F32 activations, bias, extreme values), the F16 tensor-core matmul for more

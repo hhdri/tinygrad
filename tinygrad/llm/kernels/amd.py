@@ -7,7 +7,7 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_linear_supported, nv_q8_linear, nv_f16_gemv, nv_mmq, nv_mmq_supported
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -51,6 +51,12 @@ def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
 def _reg(shape:tuple[int, ...], value:float, dep:UOp|None=None) -> UOp:
   ret = UOp.alloc(shape, dtypes.float, addrspace=AddrSpace.REG)
   return ret.after((ret if dep is None else ret.after(dep)).store(ret.const_like(value)))
+
+def _pad_to_max(t:Tensor) -> Tensor:
+  # a symbolic slice of a max-size buffer (a custom kernel's padded output) passes on the whole buffer: the padded rows only feed
+  # outputs past the live tokens, which the kernels skip. Padding the slice instead would copy it
+  if (u:=t.uop).op is Ops.SHRINK and u.src[0].shape == t.max_shape and u.src[0].base.has_buffer_identity(after_ok=True): return Tensor(u.src[0])
+  return t.pad_to(t.max_shape)
 
 # ******** quant linear: q8-activation kernels over packed ggml weights ********
 
@@ -132,7 +138,13 @@ class Linear(nn.Linear):
         return super().__call__(x)
     assert self.ggml_type is not None
     numel = x.numel()
-    if not isinstance(numel, int) or numel != self.in_features: return x.linear(self.dense.T, self.bias)
+    if prod(x.max_shape) > self.in_features and self.out_features % 16 == 0 and nv_mmq_supported(self.weight.device):
+      out = nv_mmq(self.weight, x if isinstance(numel, int) else _pad_to_max(x),
+                   self.in_features, self.out_features, self.ggml_type, None if isinstance(numel, int) else numel//self.in_features)
+      if not isinstance(numel, int): out = out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+      return out if self.bias is None else out + self.bias
+    if not isinstance(numel, int) or numel != self.in_features:
+      return x.linear(self.dense.T, self.bias)
     out = nv_q8_linear(self.weight, self.ggml_type, x, self.in_features, self.out_features)
     return out if self.bias is None else out + self.bias
 
