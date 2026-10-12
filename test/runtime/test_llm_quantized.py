@@ -1,8 +1,8 @@
 import gc, itertools, unittest, weakref
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid, flash_attention
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_mmq, nv_flash_attention, nv_mmq_supported
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.helpers import not_support_multi_device
 
@@ -225,3 +225,47 @@ class TestNVQuantLinear(unittest.TestCase):
       self.assertIsNone(linear.ggml_type)
 
 if __name__ == "__main__": unittest.main()
+
+class TestNVFlashAttention(unittest.TestCase):
+  def setUp(self):
+    if not nv_mmq_supported(Device.DEFAULT): self.skipTest("NV or CUDA (sm_80+) required")
+
+  def test_flash_attention_prefill(self):
+    # causal attention over the half KV cache vs float64 NumPy: GQA, chunk offsets, padded symbolic chunks, a single token
+    rng = np.random.default_rng(0)
+    B, H, KVH, D, N = 1, 4, 2, 64, 256
+    # T_max None: a static length that is not a whole 64-row block
+    for start, T, T_max in ((0, 64, 64), (0, 37, 64), (64, 100, 128), (5, 128, 128), (0, 1, 64), (3, 45, None)):
+      with self.subTest(start=start, T=T, T_max=T_max):
+        cache = np.zeros((2, B, KVH, N, D), np.float16)
+        cache[:, :, :, :start+T] = rng.standard_normal((2, B, KVH, start+T, D)).astype(np.float16)
+        q = rng.standard_normal((B, H, T, D)).astype(np.float32)
+        if T_max is None: actual = nv_flash_attention(Tensor(q).realize(), Tensor(cache).realize(), start+T).numpy()
+        else:
+          qt = Tensor(np.pad(q, ((0,0), (0,0), (0,T_max-T), (0,0)))).realize()
+          v = UOp.variable("toks", 1, T_max).bind(T)
+          qin, end = (qt, start+T) if T == T_max else (qt[:, :, :v], start+v)
+          out = nv_flash_attention(qin, Tensor(cache).realize(), end).realize()
+          actual = np.frombuffer(out.uop.base.buffer.as_memoryview(), np.float32).reshape(B, H, T_max, D)[:, :, :T]
+        k, v = (np.repeat(cache[i, :, :, :start+T].astype(np.float64), H//KVH, axis=1) for i in range(2))
+        scores = q.astype(np.float16).astype(np.float64) @ k.transpose(0, 1, 3, 2) / np.sqrt(D)
+        scores[..., np.arange(start+T)[None, :] > (start + np.arange(T))[:, None]] = -np.inf
+        probs = np.exp(scores - scores.max(-1, keepdims=True))
+        np.testing.assert_allclose(actual, (probs / probs.sum(-1, keepdims=True)) @ v, atol=5e-3, rtol=5e-3)
+
+  def test_flash_attention_decode(self):
+    # single-token attention over the half KV cache vs float64 NumPy: Qwen3's 4-query GQA group, chunk boundaries, a context longer
+    # than one round of partial chunks, and a symbolic length
+    rng = np.random.default_rng(1)
+    B, H, KVH, D, N = 1, 8, 2, 128, 4096
+    for L, symbolic in ((1, False), (31, False), (32, False), (33, False), (560, True), (2049, False), (4096, True)):
+      with self.subTest(L=L, symbolic=symbolic):
+        cache = np.zeros((2, B, KVH, N, D), np.float16)
+        cache[:, :, :, :L] = rng.standard_normal((2, B, KVH, L, D)).astype(np.float16)
+        q = rng.standard_normal((B, H, 1, D)).astype(np.float32)
+        end = UOp.variable("start_pos", 0, N-1).bind(L-1) + 1 if symbolic else L
+        actual = flash_attention(Tensor(q).realize(), Tensor(cache).realize(), end).numpy()
+        k, v = (np.repeat(cache[i, :, :, :L].astype(np.float64), H//KVH, axis=1) for i in range(2))
+        scores = q.astype(np.float16).astype(np.float64) @ k.transpose(0, 1, 3, 2) / np.sqrt(D)
+        probs = np.exp(scores - scores.max(-1, keepdims=True))
+        np.testing.assert_allclose(actual, (probs / probs.sum(-1, keepdims=True)) @ v, atol=5e-3, rtol=5e-3)
