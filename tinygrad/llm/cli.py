@@ -139,6 +139,7 @@ class FallbackTemplate:
 
 from tinygrad.llm.serve import LLMServer
 
+@Context(ALLOW_TF32=getenv("ALLOW_TF32", 1))
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
