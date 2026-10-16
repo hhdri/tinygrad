@@ -1,13 +1,22 @@
 import unittest
 from tinygrad import Device, Tensor, dtypes
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
-from tinygrad.uop.ops import AxisType
+from tinygrad.uop.ops import UOp, AxisType
 from tinygrad.codegen.opt.postrange import Scheduler
 
 # TODO: write a clean version of this
-from test.runtime.test_linearizer import helper_linearizer_opt
+from test.runtime.test_linearizer import helper_linearizer_opt, helper_realized_ast
 
 class TestKernelOpts(unittest.TestCase):
+  def test_rejected_symbolic_split_leaves_ast_unchanged(self):
+    # a split of a symbolic axis pads it first: a split rejected after that must not keep the pad
+    n = UOp.variable("n", 1, 64)
+    ast, _ = helper_realized_ast(Tensor.empty(4, 64).realize()[:, :n.bind(37)].sum(1))
+    scheduler = Scheduler(ast, Device[Device.DEFAULT].renderer)
+    with self.assertRaisesRegex(KernelOptError, "don't unroll more than 32"):
+      scheduler.apply_opt(Opt(OptOps.SPLIT, 1, (64, AxisType.UPCAST)))
+    self.assertIs(scheduler.ast, ast)
+
   def test_opt_without_axis(self):
     ast = Tensor.empty(32, 32).sum(1).schedule_linear().src[-1].src[0]
     for opt in [Opt(OptOps.SPLIT, None, (2, AxisType.UPCAST)), Opt(OptOps.PADTO, None, 32), Opt(OptOps.SWAP, None, 1)]:
