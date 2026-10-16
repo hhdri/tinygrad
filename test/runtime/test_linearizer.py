@@ -12,12 +12,26 @@ from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.renderer.isa import ISARenderer
-from test.helpers import replace_opts, check_schedule
+from test.helpers import replace_opts, check_schedule, buffer_uops
 from test.runtime.test_softmax_fusion import single_kernel_softmax
 MOCKGPU = DEV.interface.startswith("MOCK")
 
 @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, ISARenderer), "isa backends don't preserve the op spec when lowering")
 class TestLinearizer(unittest.TestCase):
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
+  def test_split_symbolic_axis(self):
+    # a symbolic size can't be split exactly: SPLIT pads it to a multiple of the split, and the padded lanes are masked
+    ref = np.arange(4*64, dtype=np.float32).reshape(4, 64)
+    a = Tensor(ref).realize()
+    v = UOp.variable("n", 1, 64)
+    for n in (37, 64, 1):
+      with self.subTest(n=n):
+        ast, bufs = helper_realized_ast(a[:, :v.bind(n)] * 2 + 1)
+        prg = to_program(replace_opts(ast, [Opt(OptOps.SPLIT, 1, (16, AxisType.LOCAL))]), Device[Device.DEFAULT].renderer)
+        run_linear(UOp(Ops.LINEAR, src=(prg.call(*buffer_uops(prg, bufs)),)), {"n": n})
+        out = np.frombuffer(bufs[0].as_memoryview(), np.float32).reshape(4, 64)[:, :n]  # symbolic rows keep the max stride
+        np.testing.assert_equal(out, ref[:, :n]*2+1)
+
   def test_arg_dedup(self):
     # NOTE: this realize exists because Tensor.numpy calls .contiguous() internally
     # without contiguous folding, rand.to("CPU") and rand.contiguous().to("CPU") are different UOps.
