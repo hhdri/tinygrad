@@ -146,7 +146,7 @@ pm_fix_deviceless = PatternMatcher([
 ])
 
 @functools.cache
-def _apply_reshape(in_shape:tuple[sint,...], out_shape:tuple[sint, ...], urngs:UOp) -> UOp:
+def _apply_reshape(in_shape:tuple[sint,...], out_shape:tuple[sint, ...], urngs:UOp, drop_unused_valids:bool=True) -> UOp:
   acc:sint = 1
   axes_in:list[UOp] = []
   for s,src in list(zip(out_shape, urngs.src))[::-1]:
@@ -158,11 +158,14 @@ def _apply_reshape(in_shape:tuple[sint,...], out_shape:tuple[sint, ...], urngs:U
     axes_out.append(combined_axes % s)
     combined_axes //= s
   # this simplify is doing a lot of heavy lifting. this is the replacement for the reshape view merging code
-  return graph_rewrite(UOp.sink(*axes_out[::-1]), symbolic+pm_simplify_valid+pm_drop_and_clauses, name="reshape")
+  # a load can drop the conditions its simplified address no longer uses (the loaded value is selected by its own where), but
+  # a store's valid is its gate even when the simplification used it to remove a range from the address
+  return graph_rewrite(UOp.sink(*axes_out[::-1]), symbolic+pm_simplify_valid+(pm_drop_and_clauses if drop_unused_valids else PatternMatcher([])),
+                       name="reshape")
 
 # this is the definition of the movement ops
 @functools.cache
-def apply_movement_op(op:Ops, in_shape:tuple[sint,...], arg:tuple, rngs:tuple[UOp, ...]) -> tuple[UOp, ...]:
+def apply_movement_op(op:Ops, in_shape:tuple[sint,...], arg:tuple, rngs:tuple[UOp, ...], drop_unused_valids:bool=True) -> tuple[UOp, ...]:
   match op:
     case Ops.SHRINK:  rngs = tuple(a if off == 0 else a+off for a,(off,_) in zip(rngs, arg))
     case Ops.PERMUTE: rngs = tuple(rngs[p] for p in argsort(arg))
@@ -175,7 +178,7 @@ def apply_movement_op(op:Ops, in_shape:tuple[sint,...], arg:tuple, rngs:tuple[UO
     case Ops.RESHAPE:
       sink = UOp.sink(*rngs).simplify() # NOTE: this applies any commutative flips to the rngs early
       sub_array = {r:r.replace(arg=(AxisType.PLACEHOLDER, i)) for i,r in enumerate(sink.ranges)}
-      rngs = _apply_reshape(in_shape, arg, sink.substitute(sub_array)).substitute({v:k for k,v in sub_array.items()}).src
+      rngs = _apply_reshape(in_shape, arg, sink.substitute(sub_array), drop_unused_valids).substitute({v:k for k,v in sub_array.items()}).src
     case _: raise RuntimeError(f"{op} is not a MovementOp")
   return rngs
 
