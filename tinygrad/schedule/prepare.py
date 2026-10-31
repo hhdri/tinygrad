@@ -62,19 +62,23 @@ pm_fold_moved_after = PatternMatcher([
 ])
 
 # movement op on INDEX as a PatternMatcher
-def _mop_index(r:UOp, idx:UOp):
+def _mop_index(r:UOp, idx:UOp, drop_unused_valids:bool=True):
   idxs = idx.src[1:]
   if len(idxs) == len(r.shape):
-    return r.src[0].index(*apply_movement_op(r.op, r.src[0].shape, r.marg, idxs), arg=idx.arg)
+    return r.src[0].index(*apply_movement_op(r.op, r.src[0].shape, r.marg, idxs, drop_unused_valids), arg=idx.arg)
   if r.op is Ops.RESHAPE:
     src_prefix = len(r.src[0].shape) - len(r.shape[len(idxs):])
     if src_prefix >= 0 and r.src[0].shape[src_prefix:] == r.shape[len(idxs):]:
-      if src_prefix == 0: return r.src[0]
-      ret = r.src[0].index(*apply_movement_op(r.op, r.src[0].shape[:src_prefix], r.shape[:len(idxs)], idxs), arg=idx.arg)
+      ret = r.src[0].index(*apply_movement_op(r.op, r.src[0].shape[:src_prefix], r.shape[:len(idxs)], idxs, drop_unused_valids), arg=idx.arg)
       return ret if ret.shape == idx.shape else None
 
+def _mop_store_index(r:UOp, idx:UOp, st:UOp):
+  # the valid of a store's index is its gate: keep every condition while moving the index through movement ops
+  return st.replace(src=(new_idx,)+st.src[1:]) if (new_idx:=_mop_index(r, idx, drop_unused_valids=False)) is not None else None
+
 pm_mops = PatternMatcher([
-  # handle movement ops on INDEX
+  # handle movement ops on INDEX, store indices first (pm_mops runs bottom up, so the store is seen before its index)
+  (UPat(GroupOp.Movement, name="r").f(Ops.INDEX, allow_any_len=True, name="idx").f(Ops.STORE, allow_any_len=True, name="st"), _mop_store_index),
   (UPat(GroupOp.Movement, name="r").f(Ops.INDEX, allow_any_len=True, name="idx"), _mop_index),
   # A store through a padded view gates the destination index, not its loaded value.
   (UPat.var("a").where(UPat.var("b").where(UPat.var("dst"), 0), UPat.var("pad")).store(UPat.var("val")),
@@ -89,23 +93,6 @@ pm_mops = PatternMatcher([
 
 # *****************
 # 0. do some cleanup rewrites, mostly copied from the old stuff
-
-# stop at materialization boundaries, including COPYs/STAGEs already lowered to AFTER+STORE
-def store_hazard_boundary(s:UOp):
-  if s.op in {Ops.COPY, Ops.STAGE}: return False
-  if s.op is Ops.AFTER: return not any(d.op is Ops.STORE and d.src[0].base is s.src[0].base for d in s.src[1:])
-  return True
-
-def fix_store_hazard(target:UOp, src:UOp):
-  if (base:=target.base) not in src.toposort(): return None
-  # PERMUTE reorders indices, SHRINK can have overlapping regions when dest is also shrunk
-  unsafe = {Ops.PERMUTE} | ({Ops.SHRINK} if any(u.op is Ops.SHRINK for u in target.toposort(gate=lambda u: u is not base)) else set())
-  view = target
-  while view.op is Ops.RESHAPE: view = view.src[0]
-  reaches_base: dict[UOp, bool] = {}
-  for s in src.toposort(gate=store_hazard_boundary):
-    reaches_base[s] = any(c is base or reaches_base.get(c) for c in s.src)
-    if reaches_base[s] and s.op in unsafe and not (s is view and s.op is Ops.SHRINK): return target.store(src.contiguous())
 
 def split_reduceop(reduce:UOp, x:UOp):
   if prod(reduce.shape) == 0: return None
@@ -212,9 +199,6 @@ earliest_rewrites = mop_cleanup+PatternMatcher([
   # remove DETACH/CONTIGUOUS_BACKWARD (TODO: this is copied in allocations)
   (UPat((Ops.DETACH, Ops.CONTIGUOUS_BACKWARD), name="x"), lambda x: x.src[0]),
 
-  # SINK only ever references the base
-  (UPat(Ops.SINK, name="x"), lambda x: x.replace(src=tuple(y.unsharded_base for y in x.src))),
-
   # ** copy rules **
 
   # a copy to the same device as the source is not allowed: it is a no-op, STAGE materializes on the same device
@@ -245,9 +229,6 @@ earliest_rewrites = mop_cleanup+PatternMatcher([
 
   # materialize the src of a cross device STORE on its own device first: the STORE itself is the copy
   (UPat(Ops.STORE, src=(UPat(name="dest"), UPat(name="src"))), materialize_cross_device_src),
-
-  # fix store hazard (dest is in used in src) by adding contiguous: TestAssign.test_post_flipped_assignment
-  (UPat(Ops.STORE, src=(UPat(name="target"), UPat(name="src"))), fix_store_hazard),
 
   # remove two STOREs that store the same thing to the same place: TestSchedule.test_dedup_Assign
   (UPat.var("buf").after(UPat.var("buf").store(UPat.var("src")), name="a1").after(UPat.var("a1").store(UPat.var("src"))), lambda buf,src,a1:a1),
