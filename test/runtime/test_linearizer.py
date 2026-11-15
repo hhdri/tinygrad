@@ -7,6 +7,7 @@ from tinygrad.device import Device, Buffer
 from tinygrad.tensor import Tensor, _to_np_dtype
 from tinygrad.engine.realize import run_linear
 from tinygrad.codegen import to_program
+from tinygrad.codegen.opt.postrange import Scheduler
 from tinygrad.helpers import Context, dedup, TC_SELECT, TC_OPT, DEV
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.renderer.ptx import PTXRenderer
@@ -18,6 +19,26 @@ MOCKGPU = DEV.interface.startswith("MOCK")
 
 @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, ISARenderer), "isa backends don't preserve the op spec when lowering")
 class TestLinearizer(unittest.TestCase):
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
+  def test_split_symbolic_axis(self):
+    # a symbolic size can't be split exactly: SPLIT pads it to a multiple of the split, and the padded lanes are masked
+    ref = np.arange(4*64, dtype=np.float32).reshape(4, 64)
+    a = Tensor(ref).realize()
+    v = UOp.variable("n", 1, 64)
+    for n in (37, 64, 1):
+      with self.subTest(n=n):
+        linear, var_vals = (a[:, :v.bind(n)] * 2 + 1).linear_with_vars()
+        call, ren = linear.src[-1], Device[Device.DEFAULT].renderer
+        shape = Scheduler(call.src[0], ren).full_shape
+        axis = next(i for i,s in enumerate(shape) if not isinstance(s, int))
+        prg = to_program(replace_opts(call.src[0], [Opt(OptOps.SPLIT, axis, (16, AxisType.LOCAL))]), ren)
+        # run the split program with the call's own args: kernel params are slots into them, and the variable's slot is backend-dependent
+        split_call = prg.call(*call.src[1:])
+        run_linear(UOp(Ops.LINEAR, src=linear.src[:-1] + (split_call,)), var_vals)
+        out_buf = call.src[1].buffer
+        out = np.frombuffer(out_buf.as_memoryview(), np.float32).reshape(4, 64)[:, :n]  # symbolic rows keep the max stride
+        np.testing.assert_equal(out, ref[:, :n]*2+1)
+
   def test_arg_dedup(self):
     # NOTE: this realize exists because Tensor.numpy calls .contiguous() internally
     # without contiguous folding, rand.to("CPU") and rand.contiguous().to("CPU") are different UOps.
