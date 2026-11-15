@@ -13,7 +13,7 @@ from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.renderer.x86 import ISARenderer
-from test.helpers import replace_opts, check_schedule, buffer_uops
+from test.helpers import replace_opts, check_schedule
 from test.runtime.test_softmax_fusion import single_kernel_softmax
 MOCKGPU = DEV.interface.startswith("MOCK")
 
@@ -27,11 +27,13 @@ class TestLinearizer(unittest.TestCase):
     v = UOp.variable("n", 1, 64)
     for n in (37, 64, 1):
       with self.subTest(n=n):
-        ast, bufs = helper_realized_ast(a[:, :v.bind(n)] * 2 + 1)
-        axis = next(i for i,s in enumerate(Scheduler(ast, Device[Device.DEFAULT].renderer).full_shape) if not isinstance(s, int))
-        prg = to_program(replace_opts(ast, [Opt(OptOps.SPLIT, axis, (16, AxisType.LOCAL))]), Device[Device.DEFAULT].renderer)
-        run_linear(UOp(Ops.LINEAR, src=(prg.call(*buffer_uops(prg, bufs)),)), {"n": n})
-        out = np.frombuffer(bufs[0].as_memoryview(), np.float32).reshape(4, 64)[:, :n]  # symbolic rows keep the max stride
+        linear, var_vals = (a[:, :v.bind(n)] * 2 + 1).linear_with_vars()
+        call = linear.src[-1]
+        axis = next(i for i,s in enumerate(Scheduler(call.src[0], Device[Device.DEFAULT].renderer).full_shape) if not isinstance(s, int))
+        prg = to_program(replace_opts(call.src[0], [Opt(OptOps.SPLIT, axis, (16, AxisType.LOCAL))]), Device[Device.DEFAULT].renderer)
+        # keep the call's own args: kernel params are slots into them, and where the variable's slot lands depends on the backend
+        run_linear(UOp(Ops.LINEAR, src=linear.src[:-1]+(prg.call(*call.src[1:]),)), var_vals)
+        out = np.frombuffer(call.src[1].buffer.as_memoryview(), np.float32).reshape(4, 64)[:, :n]  # symbolic rows keep the max stride
         np.testing.assert_equal(out, ref[:, :n]*2+1)
 
   def test_arg_dedup(self):
