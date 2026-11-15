@@ -6,7 +6,7 @@ from tinygrad.uop.ops import Ops, GroupOp, UOp, KernelInfo, graph_rewrite, AxisT
 from tinygrad.uop.ops import axis_colors
 from tinygrad.device import Buffer
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import colored, getenv, DEBUG, NOOPT, round_up, prod, get_single_element
+from tinygrad.helpers import colored, getenv, DEBUG, NOOPT, prod, get_single_element
 from tinygrad.helpers import ALLOW_TF32, count, Context
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, check
 from tinygrad.codegen.simplify import pm_flatten_range
@@ -132,9 +132,10 @@ class Scheduler:
       check(type(opt.arg) is int and opt.arg > 1, f"padto arg is a multiple > 1, not {opt.arg}")
       # TODO: upcasted is only wrong for a range pinned in WMMA tc_upcast_axes
       check(rng.axis_type not in {AxisType.UPCAST, AxisType.WARP}, "cannot pad upcasted or warp")
-      # a symbolic size n pads to (n+arg-1)//arg*arg, which later splits divide symbolically
-      size, amt = rng.src[0], cast(int, opt.arg)
-      new_size = size.const_like(round_up(int(rng.vmax+1), amt)) if size.op is Ops.CONST else (size+(amt-1))//amt*amt
+      size = rng.src[0]
+      amt = cast(int, opt.arg)
+      # round the size up to a multiple of amt: a constant folds back to a constant, a symbolic n becomes (n+amt-1)//amt*amt
+      new_size = ((size + amt-1) // amt * amt).simplify()
       check(rng.vmax+1 > (new_size.vmax+1)//4, "pad adds more than quadruple the work")
       replaced_rng = rng.replace(src=(new_size,))
       replaces = {rng:replaced_rng}

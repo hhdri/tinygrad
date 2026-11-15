@@ -28,12 +28,15 @@ class TestLinearizer(unittest.TestCase):
     for n in (37, 64, 1):
       with self.subTest(n=n):
         linear, var_vals = (a[:, :v.bind(n)] * 2 + 1).linear_with_vars()
-        call = linear.src[-1]
-        axis = next(i for i,s in enumerate(Scheduler(call.src[0], Device[Device.DEFAULT].renderer).full_shape) if not isinstance(s, int))
-        prg = to_program(replace_opts(call.src[0], [Opt(OptOps.SPLIT, axis, (16, AxisType.LOCAL))]), Device[Device.DEFAULT].renderer)
-        # keep the call's own args: kernel params are slots into them, and where the variable's slot lands depends on the backend
-        run_linear(UOp(Ops.LINEAR, src=linear.src[:-1]+(prg.call(*call.src[1:]),)), var_vals)
-        out = np.frombuffer(call.src[1].buffer.as_memoryview(), np.float32).reshape(4, 64)[:, :n]  # symbolic rows keep the max stride
+        call, ren = linear.src[-1], Device[Device.DEFAULT].renderer
+        shape = Scheduler(call.src[0], ren).full_shape
+        axis = next(i for i,s in enumerate(shape) if not isinstance(s, int))
+        prg = to_program(replace_opts(call.src[0], [Opt(OptOps.SPLIT, axis, (16, AxisType.LOCAL))]), ren)
+        # run the split program with the call's own args: kernel params are slots into them, and the variable's slot is backend-dependent
+        split_call = prg.call(*call.src[1:])
+        run_linear(UOp(Ops.LINEAR, src=linear.src[:-1] + (split_call,)), var_vals)
+        out_buf = call.src[1].buffer
+        out = np.frombuffer(out_buf.as_memoryview(), np.float32).reshape(4, 64)[:, :n]  # symbolic rows keep the max stride
         np.testing.assert_equal(out, ref[:, :n]*2+1)
 
   def test_arg_dedup(self):
