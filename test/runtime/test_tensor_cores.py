@@ -93,12 +93,12 @@ class TestTensorCores(unittest.TestCase):
     for m in (64, 37, 1):
       # the default heuristic (TC_OPT=0) pads symbolic axes: check its schedule uses the tensor cores, then run that kernel
       with self.subTest(m=m), Context(BEAM=0):
-        # helper_realized_ast consumes the tensor it schedules, so the matmul is built again below to run it
-        ast, _ = helper_realized_ast(ta[:v.bind(m)].matmul(tb, dtype=dtypes.float))
-        lowered = to_program(ast, Device[Device.DEFAULT].renderer).src[1]  # PROGRAM's src[1] is the lowered kernel
+        linear, var_vals = ta[:v.bind(m)].matmul(tb, dtype=dtypes.float).linear_with_vars()
+        call = linear.src[-1]
+        lowered = to_program(call.src[0], Device[Device.DEFAULT].renderer).src[1]  # PROGRAM's src[1] is the lowered kernel
         self.assertTrue(any(u.op is Ops.WMMA for u in lowered.src))
-        out = ta[:v.bind(m)].matmul(tb, dtype=dtypes.float).realize()
-        result = np.frombuffer(out.uop.base.buffer.as_memoryview(), np.float32).reshape(64, 32)[:m]
+        run_linear(linear, var_vals)
+        result = np.frombuffer(call.src[1].buffer.as_memoryview(), np.float32).reshape(64, 32)[:m]
         np.testing.assert_allclose(result, a[:m].astype(np.float32) @ b.astype(np.float32), atol=1e-2, rtol=1e-2)
 
   def test_tensor_cores_fp8_signed(self):
